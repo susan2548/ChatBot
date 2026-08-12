@@ -5,10 +5,14 @@ import time
 import shutil
 import hashlib
 import zipfile
-import chromadb
 import pandas as pd
 from pypdf import PdfReader
 from google import genai
+
+# chromadb import แบบ lazy (เฉพาะตอนใช้จริงใน get_collection/delete_topic) เพราะเป็นแพ็กเกจหนักมาก
+# (onnxruntime, tokenizers, hnswlib, duckdb ฯลฯ) — db.py (ที่ใช้กับ Streamlit Cloud) import จาก
+# ไฟล์นี้แค่ read_file/chunk_text ที่ไม่เกี่ยวกับ ChromaDB เลย ไม่อยากบังคับติดตั้ง chromadb
+# ทั้งก้อนโดยไม่จำเป็นตอน deploy
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KNOWLEDGE_DIR = os.path.join(BASE_DIR, "knowledge")
@@ -228,6 +232,7 @@ def delete_topic(topic_slug):
         shutil.rmtree(topic_dir)
 
     try:
+        import chromadb
         chromadb.PersistentClient(path=CHROMA_DIR).delete_collection(name=topic_slug)
     except Exception:
         pass  # ไม่มี collection อยู่แล้วก็ข้ามไป
@@ -240,6 +245,7 @@ def delete_topic(topic_slug):
 # ---- จัดการ collection แต่ละหัวข้อ/โหมด ----
 def get_collection(mode_key):
     """แต่ละหัวข้อ/โหมดมี collection แยกกัน"""
+    import chromadb
     client = chromadb.PersistentClient(path=CHROMA_DIR)
     return client.get_or_create_collection(name=mode_key)
 
