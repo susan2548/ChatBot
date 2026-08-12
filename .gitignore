@@ -1,0 +1,18 @@
+# secrets — ห้ามหลุดขึ้น GitHub เด็ดขาด
+.env
+.streamlit/secrets.toml
+
+# ข้อมูลเก่าในเครื่อง (ย้ายขึ้น Neon แล้ว ไม่ต้อง commit)
+chroma_db/
+chat_history/
+knowledge/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# อื่นๆ
+.DS_Store
+~$*.xlsx
