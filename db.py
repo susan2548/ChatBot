@@ -29,6 +29,7 @@ _database_url = None
 _genai_client = None
 _pool = None
 _schema_ready = False
+_POOL_MAXCONN = 5
 
 
 def init_db(database_url, api_key):
@@ -45,24 +46,46 @@ def init_db(database_url, api_key):
     if _pool is None:
         # ใช้ pool แทนการเปิด connection ใหม่ทุกครั้ง — ลด latency มหาศาล เพราะแต่ละครั้งที่
         # เปิด connection ใหม่ต้องทำ TCP+SSL handshake ไปหา Neon ใหม่ทุกรอบ (ช้ามากถ้าระยะทางไกล)
-        _pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=5, dsn=database_url)
+        _pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=_POOL_MAXCONN, dsn=database_url)
 
 
 class _PooledConn:
-    """context manager: ยืม connection จาก pool มาใช้ แล้วคืนกลับ pool ตอนจบ (ไม่ปิดทิ้งจริง)"""
+    """context manager: ยืม connection จาก pool มาใช้ แล้วคืนกลับ pool ตอนจบ
+
+    Neon free tier auto-suspend หลังไม่มีคนใช้ ~5 นาที ทำให้ connection ที่ค้างอยู่ใน pool
+    ตายไปเงียบๆ ฝั่ง server โดยที่ pool ฝั่งเราไม่รู้ตัว ถ้าไม่เช็ค/ทิ้งให้ถูกต้อง connection
+    ที่ตายจะรั่วออกจาก pool ถาวร (getconn สำเร็จแต่ใช้ไม่ได้ → error → __enter__ ไม่จบ →
+    __exit__ ไม่ถูกเรียก → ไม่มีใครคืน connection กลับ pool) พอรั่วครบ maxconn ตัว pool จะ
+    "exhausted" ค้างตลอดไปจนกว่าจะ restart แอป โค้ดข้างล่างนี้เลย retry + ทิ้ง connection
+    ที่ตายแบบชัดเจน (close=True) แทนที่จะปล่อยรั่ว"""
 
     def __enter__(self):
-        self._conn = _pool.getconn()
-        register_vector(self._conn)  # ปลอดภัยเรียกซ้ำได้ทุกครั้ง เร็วมากเพราะ connection เปิดอยู่แล้ว
-        return self._conn
+        last_err = None
+        for _ in range(_POOL_MAXCONN):
+            conn = _pool.getconn()
+            try:
+                register_vector(conn)  # แถมเป็นการเช็คว่า connection นี้ยังใช้ได้จริงในตัว
+                self._conn = conn
+                return self._conn
+            except Exception as e:
+                last_err = e
+                try:
+                    _pool.putconn(conn, close=True)  # ทิ้ง connection ที่ตายแล้วให้ pool สร้างใหม่แทน
+                except Exception:
+                    pass
+        raise last_err
 
     def __exit__(self, exc_type, exc, tb):
+        close_it = False
         if exc_type is not None:
             try:
                 self._conn.rollback()
             except Exception:
-                pass
-        _pool.putconn(self._conn)
+                close_it = True  # rollback เองยังพัง แปลว่า connection นี้ตายแล้ว ทิ้งไปเลย
+        try:
+            _pool.putconn(self._conn, close=close_it)
+        except Exception:
+            pass
         return False
 
 
