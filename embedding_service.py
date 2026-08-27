@@ -54,7 +54,10 @@ class LocalOnnxEmbeddingProvider(EmbeddingProvider):
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        vectors = list(self._model.embed(texts, batch_size=4, parallel=0))
+        # ``parallel=0`` means "use all available workers" in FastEmbed and
+        # causes multiprocessing.spawn to import Streamlit's app.py in every
+        # child process. ``None`` explicitly keeps inference in this process.
+        vectors = list(self._model.embed(texts, batch_size=4, parallel=None))
         return _normalize(vectors).tolist()
 
     def embed_query(self, text: str) -> list[float]:

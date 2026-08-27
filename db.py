@@ -412,7 +412,7 @@ def resume_ingestion_job(job_id, progress_callback=None):
                     cur.execute("UPDATE ingestion_jobs SET status = 'running', error = NULL, updated_at = now() WHERE id = %s", (job_id,))
                     cur.execute(
                         "SELECT chunk_index, content FROM ingestion_job_chunks "
-                        "WHERE job_id = %s AND embedding IS NULL ORDER BY chunk_index LIMIT 64",
+                        "WHERE job_id = %s AND embedding IS NULL ORDER BY chunk_index LIMIT 16",
                         (job_id,),
                     )
                     batch = cur.fetchall()
@@ -433,7 +433,7 @@ def resume_ingestion_job(job_id, progress_callback=None):
                         cur,
                         "UPDATE ingestion_job_chunks SET embedding = %s WHERE job_id = %s AND chunk_index = %s",
                         [(Vector(vector), job_id, chunk_index) for (chunk_index, _), vector in zip(batch, vectors)],
-                        page_size=64,
+                        page_size=16,
                     )
                     cur.execute(
                         "UPDATE ingestion_jobs SET completed_chunks = "
