@@ -209,6 +209,7 @@ def _setup_schema():
                 );
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS documents_v2_source_idx ON documents_v2(topic_slug, source)")
+            cur.execute("CREATE INDEX IF NOT EXISTS documents_v2_hash_profile_idx ON documents_v2(content_hash, embedding_profile)")
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS documents_v2_embedding_idx
                 ON documents_v2 USING hnsw (embedding vector_cosine_ops)
@@ -311,7 +312,7 @@ def _insert_chunks(cur, topic_slug, filename, chunks, embeddings):
         )
 
 
-def add_document(topic_slug, path, filename):
+def add_document(topic_slug, path, filename, progress_callback=None):
     """Extract and locally embed a document, publishing it atomically.
 
     Old chunks remain searchable until every new vector is ready.  Job state is
@@ -351,7 +352,7 @@ def add_document(topic_slug, path, filename):
                     cur.execute("DELETE FROM ingestion_jobs WHERE id = %s", (job_id,))
                 conn.commit()
             return 0
-        return resume_ingestion_job(job_id)
+        return resume_ingestion_job(job_id, progress_callback=progress_callback)
     except Exception as exc:
         with _get_conn() as conn:
             with conn.cursor() as cur:
@@ -379,35 +380,61 @@ def _stage_ingestion_chunks(job_id, rows):
                 "(SELECT count(*) FROM ingestion_job_chunks WHERE job_id = %s), updated_at = now() WHERE id = %s",
                 (job_id, job_id),
             )
+            # Reuse a vector already produced for identical content. This makes
+            # retries, duplicate files, and small document edits much faster.
+            cur.execute(
+                "UPDATE ingestion_job_chunks c SET embedding = ("
+                "SELECT d.embedding FROM documents_v2 d "
+                "WHERE d.content_hash = c.content_hash AND d.embedding_profile = %s LIMIT 1"
+                ") WHERE c.job_id = %s AND c.embedding IS NULL AND EXISTS ("
+                "SELECT 1 FROM documents_v2 d WHERE d.content_hash = c.content_hash AND d.embedding_profile = %s"
+                ")",
+                (LOCAL_PROFILE, job_id, LOCAL_PROFILE),
+            )
+            cur.execute(
+                "UPDATE ingestion_jobs SET completed_chunks = "
+                "(SELECT count(*) FROM ingestion_job_chunks WHERE job_id = %s AND embedding IS NOT NULL) "
+                "WHERE id = %s",
+                (job_id, job_id),
+            )
         conn.commit()
 
 
-def resume_ingestion_job(job_id):
+def resume_ingestion_job(job_id, progress_callback=None):
     """Continue a staged ingestion job after interruption or process restart."""
     try:
-        provider = get_embedding_provider()
+        provider = None
         processed = 0
+        total_chunks = 0
         while True:
             with _get_vector_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("UPDATE ingestion_jobs SET status = 'running', error = NULL, updated_at = now() WHERE id = %s", (job_id,))
                     cur.execute(
                         "SELECT chunk_index, content FROM ingestion_job_chunks "
-                        "WHERE job_id = %s AND embedding IS NULL ORDER BY chunk_index LIMIT 16",
+                        "WHERE job_id = %s AND embedding IS NULL ORDER BY chunk_index LIMIT 64",
                         (job_id,),
                     )
                     batch = cur.fetchall()
+                    cur.execute("SELECT total_chunks, completed_chunks FROM ingestion_jobs WHERE id = %s", (job_id,))
+                    progress_row = cur.fetchone() or (0, 0)
+                    total_chunks = progress_row[0]
                 conn.commit()
+            if progress_callback:
+                progress_callback(progress_row[1], progress_row[0], "embedding")
             if not batch:
                 break
+            if provider is None:
+                provider = get_embedding_provider()
             vectors = provider.embed_documents([row[1] for row in batch])
             with _get_vector_conn() as conn:
                 with conn.cursor() as cur:
-                    for (chunk_index, _), vector in zip(batch, vectors):
-                        cur.execute(
-                            "UPDATE ingestion_job_chunks SET embedding = %s WHERE job_id = %s AND chunk_index = %s",
-                            (Vector(vector), job_id, chunk_index),
-                        )
+                    psycopg2.extras.execute_batch(
+                        cur,
+                        "UPDATE ingestion_job_chunks SET embedding = %s WHERE job_id = %s AND chunk_index = %s",
+                        [(Vector(vector), job_id, chunk_index) for (chunk_index, _), vector in zip(batch, vectors)],
+                        page_size=64,
+                    )
                     cur.execute(
                         "UPDATE ingestion_jobs SET completed_chunks = "
                         "(SELECT count(*) FROM ingestion_job_chunks WHERE job_id = %s AND embedding IS NOT NULL), "
@@ -439,11 +466,11 @@ def resume_ingestion_job(job_id):
                     "(topic_slug, source, chunk_index, content, content_hash, location_metadata, embedding_profile, embedding) "
                     "SELECT %s, %s, chunk_index, content, content_hash, location_metadata, %s, embedding "
                     "FROM ingestion_job_chunks WHERE job_id = %s ORDER BY chunk_index",
-                    (topic_slug, filename, provider.profile, job_id),
+                    (topic_slug, filename, provider.profile if provider else LOCAL_PROFILE, job_id),
                 )
                 cur.execute(
                     "UPDATE topics SET knowledge_version = knowledge_version + 1, embedding_profile = %s WHERE slug = %s",
-                    (provider.profile, topic_slug),
+                    (provider.profile if provider else LOCAL_PROFILE, topic_slug),
                 )
                 cur.execute("DELETE FROM qa_cache WHERE topic = %s", (topic_slug,))
                 cur.execute(
@@ -451,7 +478,9 @@ def resume_ingestion_job(job_id):
                     (job_id,),
                 )
             conn.commit()
-        return processed
+        if progress_callback:
+            progress_callback(1, 1, "completed")
+        return total_chunks
     except Exception as exc:
         with _get_conn() as conn:
             with conn.cursor() as cur:

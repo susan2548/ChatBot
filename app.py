@@ -597,14 +597,30 @@ with st.sidebar:
             if uploaded_files and is_admin():
                 total_chunks = 0
                 added_count = 0
+                processed_uploads = st.session_state.setdefault("processed_uploads", set())
                 for idx, uploaded in enumerate(uploaded_files):
+                    upload_hash = hashlib.sha256(uploaded.getbuffer()).hexdigest()
+                    upload_key = f"{selected_slug}|{uploaded.name}|{upload_hash}"
+                    if upload_key in processed_uploads:
+                        continue
                     ext = os.path.splitext(uploaded.name)[1]
                     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
                         tmp.write(uploaded.getbuffer())
                         tmp_path = tmp.name
+                    progress = st.progress(0, text=f"เตรียมไฟล์ {uploaded.name}...")
+
+                    def update_upload_progress(completed, total, phase):
+                        ratio = min(1.0, completed / total) if total else 0.0
+                        label = "บันทึกสำเร็จ" if phase == "completed" else f"สร้าง embedding {completed}/{total} chunks"
+                        progress.progress(ratio, text=f"{uploaded.name}: {label}")
+
                     try:
-                        total_chunks += db.add_document(selected_slug, tmp_path, uploaded.name)
+                        total_chunks += db.add_document(
+                            selected_slug, tmp_path, uploaded.name,
+                            progress_callback=update_upload_progress,
+                        )
                         added_count += 1
+                        processed_uploads.add(upload_key)
                     except Exception as e:
                         err_text = str(e)
                         if "RESOURCE_EXHAUSTED" in err_text or "429" in err_text:
@@ -619,9 +635,6 @@ with st.sidebar:
                         os.remove(tmp_path)
                         break
                     os.remove(tmp_path)
-                    # เว้นจังหวะระหว่างไฟล์ กันยิง embed รัวๆ จนชนโควตาตอนอัปโหลดหลายไฟล์พร้อมกัน
-                    if idx < len(uploaded_files) - 1:
-                        time.sleep(2)
 
                 if added_count:
                     st.success(f"เพิ่ม {added_count} ไฟล์ ({total_chunks} chunks)")
