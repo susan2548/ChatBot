@@ -16,6 +16,7 @@ import uuid
 import base64
 import hmac
 import secrets
+import re
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -597,32 +598,60 @@ def search(topic_slug, query, top_k=4):
     )
 
 
-def search_with_sources(topic_slug, query, top_k=8, min_score=0.40):
-    """Return only relevant chunks together with auditable source metadata."""
+def _normalize_retrieval_query(query):
+    normalized = re.sub(r"\s+", " ", query.strip())
+    replacements = {
+        r"\bif\s*else\b": "if else conditional statement เงื่อนไข",
+        r"\bfor\s*loop\b": "for loop วนซ้ำ",
+        r"\bwhile\s*loop\b": "while loop วนซ้ำ",
+        r"\bswitch\s*case\b": "switch case เงื่อนไข",
+    }
+    for pattern, replacement in replacements.items():
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    return normalized
+
+
+def search_with_sources(topic_slug, query, top_k=8, min_score=0.28):
+    """Return relevant chunks using semantic retrieval plus exact-term boosting."""
     provider = get_embedding_provider()
-    query_emb = provider.embed_query(query)
+    normalized_query = _normalize_retrieval_query(query)
+    query_emb = provider.embed_query(normalized_query)
+    candidate_limit = max(top_k * 3, 24)
     with _get_vector_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT content, source, location_metadata, 1 - (embedding <=> %s) AS score "
                 "FROM documents_v2 WHERE topic_slug = %s AND embedding_profile = %s "
                 "ORDER BY embedding <=> %s LIMIT %s",
-                (Vector(query_emb), topic_slug, provider.profile, Vector(query_emb), top_k),
+                (Vector(query_emb), topic_slug, provider.profile, Vector(query_emb), candidate_limit),
             )
             rows = cur.fetchall()
-    results = []
+    exact_terms = {
+        term.lower() for term in re.findall(r"[A-Za-z_][A-Za-z0-9_+#.-]*", normalized_query)
+        if len(term) >= 2
+    }
+    ranked = []
     for row in rows:
-        score = float(row[3])
-        if score < min_score:
-            continue
+        semantic_score = float(row[3])
+        lowered_content = row[0].lower()
+        matched_terms = sum(1 for term in exact_terms if term in lowered_content)
+        lexical_boost = min(0.15, matched_terms * 0.05)
+        score = semantic_score + lexical_boost
         metadata = row[2] if isinstance(row[2], dict) else json.loads(row[2] or "{}")
-        results.append({
-            "citation_id": f"D{len(results) + 1}",
+        ranked.append({
             "content": row[0],
             "source": row[1],
             "location": metadata.get("location", "เนื้อหา"),
             "score": score,
+            "semantic_score": semantic_score,
         })
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    if not ranked or ranked[0]["score"] < min_score:
+        return []
+    adaptive_floor = max(0.24, ranked[0]["score"] - 0.18)
+    results = [item for item in ranked if item["score"] >= adaptive_floor][:top_k]
+    for index, item in enumerate(results, start=1):
+        item["citation_id"] = f"D{index}"
     return results
 
 
