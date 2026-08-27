@@ -5,6 +5,7 @@ import time
 import shutil
 import hashlib
 import zipfile
+import csv
 import pandas as pd
 from pypdf import PdfReader
 from google import genai
@@ -96,18 +97,7 @@ def extract_sections(path):
                     sections.append({"text": " | ".join(cells), "location": f"ชีต {sheet_name}, แถว {row_number}"})
         return sections
     if ext == ".csv":
-        frame = pd.read_csv(path).fillna("")
-        headers = [str(column) for column in frame.columns]
-        return [
-            {
-                "text": " | ".join(
-                    f"{header}: {value}" for header, value in zip(headers, values) if str(value).strip()
-                ),
-                "location": f"แถว {row_number}",
-            }
-            for row_number, values in enumerate(frame.itertuples(index=False, name=None), start=2)
-            if any(str(value).strip() for value in values)
-        ]
+        return list(_iter_csv_sections(path))
     if ext == ".pdf":
         reader = PdfReader(path)
         sections = []
@@ -164,13 +154,51 @@ def extract_sections(path):
     return [{"text": text, "location": "เนื้อหา"}] if text else []
 
 
+def _detect_text_encoding(path):
+    with open(path, "rb") as handle:
+        sample = handle.read(65536)
+    for encoding in ("utf-8-sig", "utf-8", "cp874", "tis-620"):
+        try:
+            sample.decode(encoding)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeError("ไม่สามารถตรวจ encoding ของไฟล์ได้ (รองรับ UTF-8, CP874 และ TIS-620)")
+
+
+def _iter_csv_sections(path):
+    """Read CSV rows incrementally to keep large uploads within cloud memory."""
+    encoding = _detect_text_encoding(path)
+    with open(path, "r", encoding=encoding, newline="") as handle:
+        sample = handle.read(8192)
+        handle.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.DictReader(handle, dialect=dialect)
+        headers = reader.fieldnames or []
+        for row_number, row in enumerate(reader, start=2):
+            cells = [
+                f"{header}: {row.get(header, '')}"
+                for header in headers
+                if str(row.get(header, "") or "").strip()
+            ]
+            if cells:
+                yield {"text": " | ".join(cells), "location": f"แถว {row_number}"}
+
+
+def iter_chunks(path, max_chars=450, overlap=60):
+    ext = os.path.splitext(path)[1].lower()
+    sections = _iter_csv_sections(path) if ext == ".csv" else extract_sections(path)
+    for section in sections:
+        for text in chunk_text(section["text"], size=max_chars, overlap=overlap):
+            yield {"text": text, "location": section["location"]}
+
+
 def build_chunks(path, max_chars=450, overlap=60):
     """Create conservative chunks and preserve the location of each section."""
-    chunks = []
-    for section in extract_sections(path):
-        for text in chunk_text(section["text"], size=max_chars, overlap=overlap):
-            chunks.append({"text": text, "location": section["location"]})
-    return chunks
+    return list(iter_chunks(path, max_chars=max_chars, overlap=overlap))
 
 
 def _read_html(path):

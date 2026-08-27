@@ -25,7 +25,7 @@ from google import genai
 from google.genai import types
 
 # ใช้ฟังก์ชันอ่านไฟล์/ตัด chunk ตัวเดียวกับ rag.py (ไม่ผูกกับ ChromaDB เลย เอามาใช้ซ้ำได้ปลอดภัย)
-from rag import read_file, chunk_text, build_chunks, SUPPORTED_EXTS, ZIP_EXT
+from rag import read_file, chunk_text, build_chunks, iter_chunks, SUPPORTED_EXTS, ZIP_EXT
 from embedding_service import get_embedding_provider, LOCAL_DIMENSION, LOCAL_PROFILE
 
 EMBED_DIM = 768  # pgvector index (hnsw/ivfflat) รองรับสูงสุด 2000 มิติ เลยตัด gemini-embedding-001 ลงมาที่ 768
@@ -321,46 +321,85 @@ def add_document(topic_slug, path, filename):
         return _add_zip(topic_slug, path)
 
     job_id = str(uuid.uuid4())
-    chunks = build_chunks(path)
-    if not chunks:
-        return 0
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO ingestion_jobs (id, topic_slug, filename, status, total_chunks) "
                 "VALUES (%s, %s, %s, 'pending', %s)",
-                (job_id, topic_slug, filename, len(chunks)),
+                (job_id, topic_slug, filename, 0),
             )
-            for index, chunk in enumerate(chunks):
-                cur.execute(
-                    "INSERT INTO ingestion_job_chunks "
-                    "(job_id, chunk_index, content, content_hash, location_metadata) VALUES (%s, %s, %s, %s, %s)",
-                    (
-                        job_id, index, chunk["text"],
-                        hashlib.sha256(chunk["text"].encode("utf-8")).hexdigest(),
-                        psycopg2.extras.Json({"location": chunk["location"]}),
-                    ),
-                )
         conn.commit()
-    return resume_ingestion_job(job_id)
+    try:
+        staged = 0
+        batch = []
+        for index, chunk in enumerate(iter_chunks(path)):
+            batch.append((
+                job_id, index, chunk["text"],
+                hashlib.sha256(chunk["text"].encode("utf-8")).hexdigest(),
+                psycopg2.extras.Json({"location": chunk["location"]}),
+            ))
+            if len(batch) >= 250:
+                _stage_ingestion_chunks(job_id, batch)
+                staged += len(batch)
+                batch = []
+        if batch:
+            _stage_ingestion_chunks(job_id, batch)
+            staged += len(batch)
+        if staged == 0:
+            with _get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM ingestion_jobs WHERE id = %s", (job_id,))
+                conn.commit()
+            return 0
+        return resume_ingestion_job(job_id)
+    except Exception as exc:
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE ingestion_jobs SET status = 'failed', error = %s, updated_at = now() WHERE id = %s",
+                    (str(exc)[:1000], job_id),
+                )
+            conn.commit()
+        raise
+
+
+def _stage_ingestion_chunks(job_id, rows):
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(
+                cur,
+                "INSERT INTO ingestion_job_chunks "
+                "(job_id, chunk_index, content, content_hash, location_metadata) VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (job_id, chunk_index) DO NOTHING",
+                rows,
+                page_size=250,
+            )
+            cur.execute(
+                "UPDATE ingestion_jobs SET total_chunks = "
+                "(SELECT count(*) FROM ingestion_job_chunks WHERE job_id = %s), updated_at = now() WHERE id = %s",
+                (job_id, job_id),
+            )
+        conn.commit()
 
 
 def resume_ingestion_job(job_id):
     """Continue a staged ingestion job after interruption or process restart."""
     try:
         provider = get_embedding_provider()
-        with _get_vector_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE ingestion_jobs SET status = 'running', error = NULL, updated_at = now() WHERE id = %s", (job_id,))
-                cur.execute(
-                    "SELECT chunk_index, content FROM ingestion_job_chunks "
-                    "WHERE job_id = %s AND embedding IS NULL ORDER BY chunk_index",
-                    (job_id,),
-                )
-                pending = cur.fetchall()
-            conn.commit()
-        for start in range(0, len(pending), 16):
-            batch = pending[start:start + 16]
+        processed = 0
+        while True:
+            with _get_vector_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE ingestion_jobs SET status = 'running', error = NULL, updated_at = now() WHERE id = %s", (job_id,))
+                    cur.execute(
+                        "SELECT chunk_index, content FROM ingestion_job_chunks "
+                        "WHERE job_id = %s AND embedding IS NULL ORDER BY chunk_index LIMIT 16",
+                        (job_id,),
+                    )
+                    batch = cur.fetchall()
+                conn.commit()
+            if not batch:
+                break
             vectors = provider.embed_documents([row[1] for row in batch])
             with _get_vector_conn() as conn:
                 with conn.cursor() as cur:
@@ -376,6 +415,7 @@ def resume_ingestion_job(job_id):
                         (job_id, job_id),
                     )
                 conn.commit()
+            processed += len(batch)
 
         with _get_vector_conn() as conn:
             with conn.cursor() as cur:
@@ -411,7 +451,7 @@ def resume_ingestion_job(job_id):
                     (job_id,),
                 )
             conn.commit()
-        return len(pending) if pending else 0
+        return processed
     except Exception as exc:
         with _get_conn() as conn:
             with conn.cursor() as cur:

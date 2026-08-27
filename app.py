@@ -626,10 +626,13 @@ with st.sidebar:
                 if added_count:
                     st.success(f"เพิ่ม {added_count} ไฟล์ ({total_chunks} chunks)")
 
-            failed_jobs = [job for job in db.list_ingestion_jobs(selected_slug) if job["status"] == "failed"]
-            if failed_jobs:
-                with st.expander(f"งานอัปโหลดที่ทำต่อได้ ({len(failed_jobs)})"):
-                    for job in failed_jobs:
+            incomplete_jobs = [
+                job for job in db.list_ingestion_jobs(selected_slug)
+                if job["status"] in ("pending", "running", "failed")
+            ]
+            if incomplete_jobs:
+                with st.expander(f"งานอัปโหลดที่ทำต่อได้ ({len(incomplete_jobs)})", expanded=True):
+                    for job in incomplete_jobs:
                         st.caption(f"{job['filename']}: {job['completed']}/{job['total']} chunks — {job['error'] or 'ถูกขัดจังหวะ'}")
                         if st.button("ทำงานนี้ต่อ", key=f"resume_{job['id']}"):
                             try:
