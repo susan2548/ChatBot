@@ -528,6 +528,26 @@ with st.sidebar:
     if st.button("➕ แชทใหม่"):
         new_chat()
 
+    st.caption("โหมดของแชทนี้")
+    if st.session_state["active_topic_slug"]:
+        st.markdown(f"**📚 {st.session_state['active_topic_name']}**")
+        mode_change_col, mode_clear_col = st.columns(2)
+        with mode_change_col:
+            if st.button("เปลี่ยน", key="sidebar_change_topic", use_container_width=True):
+                st.session_state["awaiting_topic_pick"] = True
+                st.session_state["topic_pick_filter"] = ""
+                st.rerun()
+        with mode_clear_col:
+            if st.button("ทั่วไป", key="sidebar_clear_topic", use_container_width=True):
+                set_current_chat_mode()
+                st.rerun()
+    else:
+        st.markdown("**💬 แชททั่วไป**")
+        if st.button("เลือก Knowledge", key="sidebar_pick_topic", use_container_width=True):
+            st.session_state["awaiting_topic_pick"] = True
+            st.session_state["topic_pick_filter"] = ""
+            st.rerun()
+
     # ===== ส่วนจัดการหัวข้อความรู้ (admin เท่านั้น) =====
     # เช็คสิทธิ์ที่ระดับ logic ตรงนี้โดยตรง ไม่ได้ซ่อนแค่ UI เฉยๆ
     if is_admin() and st.toggle(
@@ -792,16 +812,26 @@ st.markdown("""
     .block-container {max-width: 980px; padding-top: 1.4rem; padding-bottom: 7rem;}
     [data-testid="stSidebar"] {border-right: 1px solid rgba(128,128,128,.18);}
     [data-testid="stChatMessage"] {border-radius: 14px; padding: .35rem .7rem;}
-    .mode-card {padding: .75rem 1rem; border-radius: 12px; margin: .5rem 0 .8rem 0;}
-    .mode-knowledge {background: rgba(37,99,235,.10); border: 1px solid rgba(37,99,235,.32);}
-    .mode-general {background: rgba(16,185,129,.09); border: 1px solid rgba(16,185,129,.30);}
-    .mode-title {font-weight: 700; margin-bottom: .1rem;}
-    .mode-help {font-size: .84rem; opacity: .78;}
+    .mode-pill {display: inline-block; padding: .28rem .7rem; border-radius: 999px;
+        font-size: .82rem; font-weight: 650; margin: .1rem 0 .6rem 0;}
+    .mode-pill-knowledge {background: rgba(37,99,235,.12); color: #3b82f6;}
+    .mode-pill-general {background: rgba(16,185,129,.11); color: #10b981;}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("💀 Major.AI")
 st.caption("ถามทั่วไป หรือเลือก Knowledge เพื่อให้ตอบจากเอกสารเฉพาะเรื่อง")
+if st.session_state["active_topic_slug"]:
+    safe_topic_name = html.escape(st.session_state["active_topic_name"] or "")
+    st.markdown(
+        f'<span class="mode-pill mode-pill-knowledge">📚 ใช้ Knowledge: {safe_topic_name}</span>',
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        '<span class="mode-pill mode-pill-general">💬 โหมดแชททั่วไป</span>',
+        unsafe_allow_html=True,
+    )
 
 # ===== คำแนะนำการใช้งาน =====
 with st.expander("❓ วิธีใช้งาน", expanded=not st.session_state["intro_dismissed"]):
@@ -866,28 +896,9 @@ if pending_web_query:
             st.session_state.pop("pending_web_query", None)
             st.rerun()
 
-# แถบนี้อยู่ชิดเหนือช่องพิมพ์ เพื่อให้รู้โหมดก่อนส่งทุกคำถาม
 if st.session_state["active_topic_slug"]:
-    mode_col, action_col = st.columns([5, 1.35], vertical_alignment="center")
-    with mode_col:
-        safe_topic_name = html.escape(st.session_state["active_topic_name"] or "")
-        st.markdown(
-            f'<div class="mode-card mode-knowledge"><div class="mode-title">📚 Knowledge: '
-            f'{safe_topic_name}</div>'
-            '<div class="mode-help">คำตอบจะยึดข้อมูลจากหัวข้อนี้ · พิมพ์ / เพื่อเปลี่ยนหัวข้อ</div></div>',
-            unsafe_allow_html=True,
-        )
-    with action_col:
-        if st.button("กลับโหมดทั่วไป", key="clear_topic_btn", use_container_width=True):
-            set_current_chat_mode()
-            st.rerun()
     input_placeholder = f"ถามจาก Knowledge: {st.session_state['active_topic_name']}"
 else:
-    st.markdown(
-        '<div class="mode-card mode-general"><div class="mode-title">💬 โหมดแชททั่วไป</div>'
-        '<div class="mode-help">ถามได้ทุกเรื่อง · พิมพ์ / เพื่อเลือก Knowledge</div></div>',
-        unsafe_allow_html=True,
-    )
     input_placeholder = "พิมพ์คำถาม หรือ / เพื่อเลือก Knowledge"
 
 if prompt := st.chat_input(input_placeholder):
