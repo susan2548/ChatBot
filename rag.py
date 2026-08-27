@@ -76,6 +76,103 @@ def read_file(path):
     return ""
 
 
+def extract_sections(path):
+    """Return text sections with stable, human-readable source locations.
+
+    The old ``read_file`` API is retained for the legacy LINE/Chroma path.
+    The hosted Postgres RAG uses this function so citations can identify the
+    page, sheet/row, slide, or paragraph that supplied an answer.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xls"):
+        sections = []
+        book = pd.ExcelFile(path)
+        for sheet_name in book.sheet_names:
+            frame = pd.read_excel(book, sheet_name=sheet_name).fillna("")
+            headers = [str(column) for column in frame.columns]
+            for row_number, values in enumerate(frame.itertuples(index=False, name=None), start=2):
+                cells = [f"{header}: {value}" for header, value in zip(headers, values) if str(value).strip()]
+                if cells:
+                    sections.append({"text": " | ".join(cells), "location": f"ชีต {sheet_name}, แถว {row_number}"})
+        return sections
+    if ext == ".csv":
+        frame = pd.read_csv(path).fillna("")
+        headers = [str(column) for column in frame.columns]
+        return [
+            {
+                "text": " | ".join(
+                    f"{header}: {value}" for header, value in zip(headers, values) if str(value).strip()
+                ),
+                "location": f"แถว {row_number}",
+            }
+            for row_number, values in enumerate(frame.itertuples(index=False, name=None), start=2)
+            if any(str(value).strip() for value in values)
+        ]
+    if ext == ".pdf":
+        reader = PdfReader(path)
+        sections = []
+        scanned_pages = []
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = (page.extract_text() or "").strip()
+            if text:
+                sections.append({"text": text, "location": f"หน้า {page_number}"})
+            else:
+                scanned_pages.append(page_number)
+        if scanned_pages:
+            try:
+                from pdf2image import convert_from_path
+                import pytesseract
+
+                for page_number in scanned_pages:
+                    images = convert_from_path(path, first_page=page_number, last_page=page_number, dpi=200)
+                    text = pytesseract.image_to_string(images[0], lang="tha+eng").strip() if images else ""
+                    if text:
+                        sections.append({"text": text, "location": f"หน้า {page_number} (OCR)"})
+            except Exception as exc:
+                raise RuntimeError(f"อ่าน PDF สแกนไม่สำเร็จ: {exc}") from exc
+        return sections
+    if ext == ".docx":
+        from docx import Document
+
+        doc = Document(path)
+        sections = [
+            {"text": paragraph.text.strip(), "location": f"ย่อหน้า {index}"}
+            for index, paragraph in enumerate(doc.paragraphs, start=1)
+            if paragraph.text.strip()
+        ]
+        for table_number, table in enumerate(doc.tables, start=1):
+            for row_number, row in enumerate(table.rows, start=1):
+                text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if text:
+                    sections.append({"text": text, "location": f"ตาราง {table_number}, แถว {row_number}"})
+        return sections
+    if ext == ".pptx":
+        from pptx import Presentation
+
+        presentation = Presentation(path)
+        sections = []
+        for slide_number, slide in enumerate(presentation.slides, start=1):
+            text = "\n".join(
+                shape.text_frame.text.strip()
+                for shape in slide.shapes
+                if shape.has_text_frame and shape.text_frame.text.strip()
+            )
+            if text:
+                sections.append({"text": text, "location": f"สไลด์ {slide_number}"})
+        return sections
+    text = read_file(path).strip()
+    return [{"text": text, "location": "เนื้อหา"}] if text else []
+
+
+def build_chunks(path, max_chars=450, overlap=60):
+    """Create conservative chunks and preserve the location of each section."""
+    chunks = []
+    for section in extract_sections(path):
+        for text in chunk_text(section["text"], size=max_chars, overlap=overlap):
+            chunks.append({"text": text, "location": section["location"]})
+    return chunks
+
+
 def _read_html(path):
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         html = f.read()

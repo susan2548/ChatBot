@@ -11,6 +11,11 @@ import shutil
 import hashlib
 import zipfile
 import tempfile
+import json
+import uuid
+import base64
+import hmac
+import secrets
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -20,7 +25,8 @@ from google import genai
 from google.genai import types
 
 # ใช้ฟังก์ชันอ่านไฟล์/ตัด chunk ตัวเดียวกับ rag.py (ไม่ผูกกับ ChromaDB เลย เอามาใช้ซ้ำได้ปลอดภัย)
-from rag import read_file, chunk_text, SUPPORTED_EXTS, ZIP_EXT
+from rag import read_file, chunk_text, build_chunks, SUPPORTED_EXTS, ZIP_EXT
+from embedding_service import get_embedding_provider, LOCAL_DIMENSION, LOCAL_PROFILE
 
 EMBED_DIM = 768  # pgvector index (hnsw/ivfflat) รองรับสูงสุด 2000 มิติ เลยตัด gemini-embedding-001 ลงมาที่ 768
 EMBED_BATCH_SIZE = 100  # Gemini embedContent รับได้สูงสุด 100 รายการต่อ batch
@@ -144,6 +150,17 @@ def _setup_schema():
             """)
 
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGSERIAL PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin','user')),
+                    active BOOLEAN NOT NULL DEFAULT true,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS chats (
                     filename TEXT PRIMARY KEY,
                     title TEXT,
@@ -173,6 +190,53 @@ def _setup_schema():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
             """)
+            cur.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS owner_id BIGINT REFERENCES users(id) ON DELETE CASCADE")
+            cur.execute("CREATE INDEX IF NOT EXISTS chats_owner_idx ON chats(owner_id, pinned, filename)")
+            cur.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS knowledge_version BIGINT NOT NULL DEFAULT 1")
+            cur.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS embedding_profile TEXT NOT NULL DEFAULT %s", (LOCAL_PROFILE,))
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS documents_v2 (
+                    id BIGSERIAL PRIMARY KEY,
+                    topic_slug TEXT NOT NULL REFERENCES topics(slug) ON DELETE CASCADE,
+                    source TEXT NOT NULL,
+                    chunk_index INT NOT NULL,
+                    content TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    location_metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    embedding_profile TEXT NOT NULL,
+                    embedding VECTOR({LOCAL_DIMENSION}) NOT NULL,
+                    UNIQUE(topic_slug, source, chunk_index, embedding_profile)
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS documents_v2_source_idx ON documents_v2(topic_slug, source)")
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS documents_v2_embedding_idx
+                ON documents_v2 USING hnsw (embedding vector_cosine_ops)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ingestion_jobs (
+                    id UUID PRIMARY KEY,
+                    topic_slug TEXT NOT NULL REFERENCES topics(slug) ON DELETE CASCADE,
+                    filename TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')),
+                    total_chunks INT NOT NULL DEFAULT 0,
+                    completed_chunks INT NOT NULL DEFAULT 0,
+                    error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS ingestion_job_chunks (
+                    job_id UUID NOT NULL REFERENCES ingestion_jobs(id) ON DELETE CASCADE,
+                    chunk_index INT NOT NULL,
+                    content TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    location_metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    embedding VECTOR({LOCAL_DIMENSION}),
+                    PRIMARY KEY (job_id, chunk_index)
+                )
+            """)
         conn.commit()
     finally:
         conn.close()
@@ -180,21 +244,8 @@ def _setup_schema():
 
 # ===== embedding =====
 def embed(texts):
-    """แปลงข้อความเป็น vector ด้วย Gemini embedding (ตัดเหลือ 768 มิติ + แบ่ง batch ถ้าเกิน 100 รายการ)"""
-    embeddings = []
-    for i in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[i:i + EMBED_BATCH_SIZE]
-        result = _genai_client.models.embed_content(
-            model="gemini-embedding-001",
-            contents=batch,
-            config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
-        )
-        # แปลงเป็น float ธรรมดาให้ชัวร์ (ค่าดิบจาก SDK อาจไม่ใช่ float เพียวๆ) ก่อนห่อด้วย
-        # pgvector.Vector(...) ตอนใช้งานจริง — เพราะ pgvector adapter รู้จักแค่ Vector/np.ndarray
-        # เท่านั้น ถ้าส่ง list เปล่าๆ ตรงๆ psycopg2 จะ fallback เป็น numeric[] แทน vector แล้ว query
-        # ที่ใช้ตัวดำเนินการ <=> จะพังด้วย "operator does not exist: vector <=> numeric[]"
-        embeddings.extend([float(x) for x in e.values] for e in result.embeddings)
-    return embeddings
+    """Create embeddings locally in the hosted container (no Gemini quota)."""
+    return get_embedding_provider().embed_documents(texts)
 
 
 # ===== หัวข้อความรู้ (topics) =====
@@ -261,23 +312,115 @@ def _insert_chunks(cur, topic_slug, filename, chunks, embeddings):
 
 
 def add_document(topic_slug, path, filename):
-    """อ่านไฟล์ → chunk → embed → เก็บลง Postgres (.zip จะถูกแตกไฟล์แล้วเพิ่มทีละไฟล์ข้างในแทน)"""
+    """Extract and locally embed a document, publishing it atomically.
+
+    Old chunks remain searchable until every new vector is ready.  Job state is
+    persisted so the UI can report failures without losing the prior source.
+    """
     if os.path.splitext(filename)[1].lower() == ZIP_EXT:
         return _add_zip(topic_slug, path)
 
-    text = read_file(path)
-    if not text:
+    job_id = str(uuid.uuid4())
+    chunks = build_chunks(path)
+    if not chunks:
         return 0
-
-    chunks = chunk_text(text)
-    embeddings = embed(chunks)
-
-    with _get_vector_conn() as conn:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
-            _upsert_source_text(cur, topic_slug, filename, text)
-            _insert_chunks(cur, topic_slug, filename, chunks, embeddings)
+            cur.execute(
+                "INSERT INTO ingestion_jobs (id, topic_slug, filename, status, total_chunks) "
+                "VALUES (%s, %s, %s, 'pending', %s)",
+                (job_id, topic_slug, filename, len(chunks)),
+            )
+            for index, chunk in enumerate(chunks):
+                cur.execute(
+                    "INSERT INTO ingestion_job_chunks "
+                    "(job_id, chunk_index, content, content_hash, location_metadata) VALUES (%s, %s, %s, %s, %s)",
+                    (
+                        job_id, index, chunk["text"],
+                        hashlib.sha256(chunk["text"].encode("utf-8")).hexdigest(),
+                        psycopg2.extras.Json({"location": chunk["location"]}),
+                    ),
+                )
         conn.commit()
-    return len(chunks)
+    return resume_ingestion_job(job_id)
+
+
+def resume_ingestion_job(job_id):
+    """Continue a staged ingestion job after interruption or process restart."""
+    try:
+        provider = get_embedding_provider()
+        with _get_vector_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE ingestion_jobs SET status = 'running', error = NULL, updated_at = now() WHERE id = %s", (job_id,))
+                cur.execute(
+                    "SELECT chunk_index, content FROM ingestion_job_chunks "
+                    "WHERE job_id = %s AND embedding IS NULL ORDER BY chunk_index",
+                    (job_id,),
+                )
+                pending = cur.fetchall()
+            conn.commit()
+        for start in range(0, len(pending), 16):
+            batch = pending[start:start + 16]
+            vectors = provider.embed_documents([row[1] for row in batch])
+            with _get_vector_conn() as conn:
+                with conn.cursor() as cur:
+                    for (chunk_index, _), vector in zip(batch, vectors):
+                        cur.execute(
+                            "UPDATE ingestion_job_chunks SET embedding = %s WHERE job_id = %s AND chunk_index = %s",
+                            (Vector(vector), job_id, chunk_index),
+                        )
+                    cur.execute(
+                        "UPDATE ingestion_jobs SET completed_chunks = "
+                        "(SELECT count(*) FROM ingestion_job_chunks WHERE job_id = %s AND embedding IS NOT NULL), "
+                        "updated_at = now() WHERE id = %s",
+                        (job_id, job_id),
+                    )
+                conn.commit()
+
+        with _get_vector_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT topic_slug, filename FROM ingestion_jobs WHERE id = %s", (job_id,))
+                job = cur.fetchone()
+                if not job:
+                    raise ValueError("ไม่พบ ingestion job")
+                topic_slug, filename = job
+                cur.execute(
+                    "SELECT string_agg(content, E'\\n\\n' ORDER BY chunk_index) FROM ingestion_job_chunks WHERE job_id = %s",
+                    (job_id,),
+                )
+                full_text = cur.fetchone()[0] or ""
+                _upsert_source_text(cur, topic_slug, filename, full_text)
+                cur.execute(
+                    "DELETE FROM documents_v2 WHERE topic_slug = %s AND source = %s",
+                    (topic_slug, filename),
+                )
+                cur.execute(
+                    "INSERT INTO documents_v2 "
+                    "(topic_slug, source, chunk_index, content, content_hash, location_metadata, embedding_profile, embedding) "
+                    "SELECT %s, %s, chunk_index, content, content_hash, location_metadata, %s, embedding "
+                    "FROM ingestion_job_chunks WHERE job_id = %s ORDER BY chunk_index",
+                    (topic_slug, filename, provider.profile, job_id),
+                )
+                cur.execute(
+                    "UPDATE topics SET knowledge_version = knowledge_version + 1, embedding_profile = %s WHERE slug = %s",
+                    (provider.profile, topic_slug),
+                )
+                cur.execute("DELETE FROM qa_cache WHERE topic = %s", (topic_slug,))
+                cur.execute(
+                    "UPDATE ingestion_jobs SET status = 'completed', completed_chunks = total_chunks, updated_at = now() WHERE id = %s",
+                    (job_id,),
+                )
+            conn.commit()
+        return len(pending) if pending else 0
+    except Exception as exc:
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE ingestion_jobs SET status = 'failed', error = %s, updated_at = now() WHERE id = %s",
+                    (str(exc)[:1000], job_id),
+                )
+            conn.commit()
+        raise
 
 
 def get_source_text(topic_slug, filename):
@@ -296,29 +439,46 @@ def delete_source_file(topic_slug, filename):
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM documents WHERE topic_slug = %s AND source = %s", (topic_slug, filename))
+            cur.execute("DELETE FROM documents_v2 WHERE topic_slug = %s AND source = %s", (topic_slug, filename))
             cur.execute("DELETE FROM sources WHERE topic_slug = %s AND filename = %s", (topic_slug, filename))
+            cur.execute("UPDATE topics SET knowledge_version = knowledge_version + 1 WHERE slug = %s", (topic_slug,))
+            cur.execute("DELETE FROM qa_cache WHERE topic = %s", (topic_slug,))
         conn.commit()
 
 
 def replace_source_file(topic_slug, path, filename):
-    """แทนที่ไฟล์เดิมด้วยไฟล์ใหม่ (path ถูกอัปโหลดใหม่แล้ว) — ลบของเก่าก่อนแล้ว re-embed ใหม่ทั้งไฟล์"""
-    delete_source_file(topic_slug, filename)
+    """Atomically replace a source; add_document removes old vectors only after embedding succeeds."""
     return add_document(topic_slug, path, filename)
 
 
 def replace_source_text(topic_slug, filename, new_text):
-    """แก้ไขเนื้อหาไฟล์ text-based โดยตรงจากกล่องข้อความ (rechunk + re-embed ใหม่ทั้งหมด)"""
-    delete_source_file(topic_slug, filename)
+    """Replace editable text atomically using the active local embedding profile."""
     new_text = new_text.strip()
     if not new_text:
+        delete_source_file(topic_slug, filename)
         return 0
 
-    chunks = chunk_text(new_text)
-    embeddings = embed(chunks)
+    chunks = chunk_text(new_text, size=450, overlap=60)
+    provider = get_embedding_provider()
+    embeddings = provider.embed_documents(chunks)
     with _get_vector_conn() as conn:
         with conn.cursor() as cur:
             _upsert_source_text(cur, topic_slug, filename, new_text)
-            _insert_chunks(cur, topic_slug, filename, chunks, embeddings)
+            cur.execute("DELETE FROM documents_v2 WHERE topic_slug = %s AND source = %s", (topic_slug, filename))
+            for index, (chunk, vector) in enumerate(zip(chunks, embeddings)):
+                cur.execute(
+                    "INSERT INTO documents_v2 "
+                    "(topic_slug, source, chunk_index, content, content_hash, location_metadata, embedding_profile, embedding) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        topic_slug, filename, index, chunk,
+                        hashlib.sha256(chunk.encode("utf-8")).hexdigest(),
+                        psycopg2.extras.Json({"location": "เนื้อหา"}),
+                        provider.profile, Vector(vector),
+                    ),
+                )
+            cur.execute("UPDATE topics SET knowledge_version = knowledge_version + 1, embedding_profile = %s WHERE slug = %s", (provider.profile, topic_slug))
+            cur.execute("DELETE FROM qa_cache WHERE topic = %s", (topic_slug,))
         conn.commit()
     return len(chunks)
 
@@ -360,19 +520,56 @@ def _add_zip(topic_slug, zip_path):
 
 
 def search(topic_slug, query, top_k=4):
-    """ค้นหา chunk ที่ใกล้เคียงกับ query มากที่สุด (cosine distance ผ่าน pgvector)"""
-    query_emb = embed([query])[0]
+    """Compatibility formatter for callers that still expect one context string."""
+    results = search_with_sources(topic_slug, query, top_k=top_k)
+    return "\n\n---\n\n".join(
+        f"[{item['citation_id']}] {item['source']} — {item['location']}\n{item['content']}"
+        for item in results
+    )
+
+
+def search_with_sources(topic_slug, query, top_k=8, min_score=0.40):
+    """Return only relevant chunks together with auditable source metadata."""
+    provider = get_embedding_provider()
+    query_emb = provider.embed_query(query)
     with _get_vector_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT content FROM documents WHERE topic_slug = %s "
+                "SELECT content, source, location_metadata, 1 - (embedding <=> %s) AS score "
+                "FROM documents_v2 WHERE topic_slug = %s AND embedding_profile = %s "
                 "ORDER BY embedding <=> %s LIMIT %s",
-                (topic_slug, Vector(query_emb), top_k),
+                (Vector(query_emb), topic_slug, provider.profile, Vector(query_emb), top_k),
             )
             rows = cur.fetchall()
-    if not rows:
-        return ""
-    return "\n\n---\n\n".join(r[0] for r in rows)
+    results = []
+    for row in rows:
+        score = float(row[3])
+        if score < min_score:
+            continue
+        metadata = row[2] if isinstance(row[2], dict) else json.loads(row[2] or "{}")
+        results.append({
+            "citation_id": f"D{len(results) + 1}",
+            "content": row[0],
+            "source": row[1],
+            "location": metadata.get("location", "เนื้อหา"),
+            "score": score,
+        })
+    return results
+
+
+def list_ingestion_jobs(topic_slug, limit=20):
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id::text, filename, status, total_chunks, completed_chunks, error, updated_at "
+                "FROM ingestion_jobs WHERE topic_slug = %s ORDER BY created_at DESC LIMIT %s",
+                (topic_slug, limit),
+            )
+            rows = cur.fetchall()
+    return [
+        {"id": r[0], "filename": r[1], "status": r[2], "total": r[3], "completed": r[4], "error": r[5], "updated_at": r[6]}
+        for r in rows
+    ]
 
 
 def list_sources(topic_slug):
@@ -386,48 +583,191 @@ def list_sources(topic_slug):
     return [r[0] for r in rows]
 
 
-# ===== ประวัติแชท =====
-def create_chat(filename):
+def topic_needs_reindex(topic_slug):
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM sources WHERE topic_slug = %s", (topic_slug,))
+            source_count = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM documents_v2 WHERE topic_slug = %s", (topic_slug,))
+            vector_count = cur.fetchone()[0]
+    return source_count > 0 and vector_count == 0
+
+
+def reindex_topic(topic_slug):
+    """Safely migrate legacy source text to the local embedding profile."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT filename, full_text FROM sources WHERE topic_slug = %s ORDER BY filename", (topic_slug,))
+            sources = cur.fetchall()
+    provider = get_embedding_provider()
+    prepared = []
+    for filename, full_text in sources:
+        chunks = chunk_text(full_text, size=450, overlap=60)
+        vectors = provider.embed_documents(chunks)
+        prepared.append((filename, chunks, vectors))
+    with _get_vector_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM documents_v2 WHERE topic_slug = %s", (topic_slug,))
+            total = 0
+            for filename, chunks, vectors in prepared:
+                for index, (chunk, vector) in enumerate(zip(chunks, vectors)):
+                    cur.execute(
+                        "INSERT INTO documents_v2 "
+                        "(topic_slug, source, chunk_index, content, content_hash, location_metadata, embedding_profile, embedding) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            topic_slug, filename, index, chunk,
+                            hashlib.sha256(chunk.encode("utf-8")).hexdigest(),
+                            psycopg2.extras.Json({"location": "ข้อมูลเดิม (ไม่มี metadata ตำแหน่ง)"}),
+                            provider.profile, Vector(vector),
+                        ),
+                    )
+                    total += 1
+            cur.execute(
+                "UPDATE topics SET embedding_profile = %s, knowledge_version = knowledge_version + 1 WHERE slug = %s",
+                (provider.profile, topic_slug),
+            )
+            cur.execute("DELETE FROM qa_cache WHERE topic = %s", (topic_slug,))
+        conn.commit()
+    return total
+
+
+# ===== ผู้ใช้ =====
+def _hash_password(password, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
+    return "scrypt$" + base64.b64encode(salt).decode("ascii") + "$" + base64.b64encode(digest).decode("ascii")
+
+
+def ensure_admin_user(password):
+    """Create the initial admin and attach legacy chats without an owner."""
+    if not password:
+        return None
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE username = 'admin'")
+            row = cur.fetchone()
+            if row:
+                user_id = row[0]
+            else:
+                cur.execute(
+                    "INSERT INTO users (username, password_hash, role) VALUES ('admin', %s, 'admin') RETURNING id",
+                    (_hash_password(password),),
+                )
+                user_id = cur.fetchone()[0]
+            cur.execute("UPDATE chats SET owner_id = %s WHERE owner_id IS NULL", (user_id,))
+        conn.commit()
+    return user_id
+
+
+def authenticate_user(username, password):
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO chats (filename) VALUES (%s) ON CONFLICT (filename) DO NOTHING",
-                (filename,),
+                "SELECT id, username, password_hash, role FROM users WHERE lower(username) = lower(%s) AND active = true",
+                (username.strip(),),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        _, salt_b64, digest_b64 = row[2].split("$", 2)
+        actual = _hash_password(password, base64.b64decode(salt_b64)).split("$", 2)[2]
+        if not hmac.compare_digest(actual, digest_b64):
+            return None
+    except Exception:
+        return None
+    return {"id": row[0], "username": row[1], "role": row[3]}
+
+
+def create_user(username, password, role="user"):
+    username = username.strip()
+    if len(username) < 3 or len(password) < 8 or role not in ("admin", "user"):
+        raise ValueError("ชื่อผู้ใช้ต้องมีอย่างน้อย 3 ตัว และรหัสผ่านอย่างน้อย 8 ตัว")
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s) RETURNING id",
+                (username, _hash_password(password), role),
+            )
+            user_id = cur.fetchone()[0]
+        conn.commit()
+    return user_id
+
+
+def list_users():
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, username, role, active, created_at FROM users ORDER BY username")
+            rows = cur.fetchall()
+    return [{"id": r[0], "username": r[1], "role": r[2], "active": r[3], "created_at": r[4]} for r in rows]
+
+
+def set_user_active(user_id, active):
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET active = %s WHERE id = %s AND username <> 'admin'", (bool(active), user_id))
+        conn.commit()
+
+
+def reset_user_password(user_id, password):
+    if len(password) < 8:
+        raise ValueError("รหัสผ่านต้องมีอย่างน้อย 8 ตัว")
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (_hash_password(password), user_id))
+        conn.commit()
+
+
+# ===== ประวัติแชท =====
+def create_chat(filename, owner_id=None):
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chats (filename, owner_id) VALUES (%s, %s) ON CONFLICT (filename) DO NOTHING",
+                (filename, owner_id),
             )
         conn.commit()
 
 
-def list_chats():
+def list_chats(owner_id=None):
     """คืนรายชื่อไฟล์แชท เรียงปักหมุดขึ้นก่อน แล้วใหม่สุดก่อนในแต่ละกลุ่ม"""
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT filename FROM chats ORDER BY pinned DESC, filename DESC"
+                "SELECT filename FROM chats WHERE (%s IS NULL OR owner_id = %s) ORDER BY pinned DESC, filename DESC",
+                (owner_id, owner_id),
             )
             rows = cur.fetchall()
     return [r[0] for r in rows]
 
 
-def load_chat(filename):
+def load_chat(filename, owner_id=None):
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT role, content, timestamp FROM chat_messages "
-                "WHERE chat_filename = %s ORDER BY seq",
-                (filename,),
+                "JOIN chats c ON c.filename = chat_messages.chat_filename "
+                "WHERE chat_filename = %s AND (%s IS NULL OR c.owner_id = %s) ORDER BY seq",
+                (filename, owner_id, owner_id),
             )
             rows = cur.fetchall()
     return [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]
 
 
-def save_chat(filename, messages):
+def save_chat(filename, messages, owner_id=None):
     """เขียนทับข้อความทั้งหมดของแชทนี้ (เรียบง่าย ปลอดภัยกว่าการอัปเดตทีละบรรทัด)"""
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO chats (filename) VALUES (%s) ON CONFLICT (filename) DO NOTHING",
-                (filename,),
+                "INSERT INTO chats (filename, owner_id) VALUES (%s, %s) "
+                "ON CONFLICT (filename) DO NOTHING",
+                (filename, owner_id),
             )
+            cur.execute("SELECT owner_id FROM chats WHERE filename = %s", (filename,))
+            chat_owner = cur.fetchone()
+            if owner_id is not None and (not chat_owner or chat_owner[0] != owner_id):
+                raise PermissionError("ไม่มีสิทธิ์แก้ไขแชทนี้")
             cur.execute("DELETE FROM chat_messages WHERE chat_filename = %s", (filename,))
             for i, msg in enumerate(messages):
                 cur.execute(
@@ -438,53 +778,53 @@ def save_chat(filename, messages):
         conn.commit()
 
 
-def delete_chat(filename):
+def delete_chat(filename, owner_id=None):
     """ลบแชท: chat_messages ลบตามด้วย ON DELETE CASCADE"""
     with _get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM chats WHERE filename = %s", (filename,))
+            cur.execute("DELETE FROM chats WHERE filename = %s AND (%s IS NULL OR owner_id = %s)", (filename, owner_id, owner_id))
         conn.commit()
 
 
-def toggle_pin(filename):
+def toggle_pin(filename, owner_id=None):
     with _get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE chats SET pinned = NOT pinned WHERE filename = %s", (filename,))
+            cur.execute("UPDATE chats SET pinned = NOT pinned WHERE filename = %s AND (%s IS NULL OR owner_id = %s)", (filename, owner_id, owner_id))
         conn.commit()
 
 
-def is_pinned(filename):
+def is_pinned(filename, owner_id=None):
     with _get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT pinned FROM chats WHERE filename = %s", (filename,))
+            cur.execute("SELECT pinned FROM chats WHERE filename = %s AND (%s IS NULL OR owner_id = %s)", (filename, owner_id, owner_id))
             row = cur.fetchone()
     return bool(row and row[0])
 
 
-def get_pinned_set():
+def get_pinned_set(owner_id=None):
     with _get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT filename FROM chats WHERE pinned = true")
+            cur.execute("SELECT filename FROM chats WHERE pinned = true AND (%s IS NULL OR owner_id = %s)", (owner_id, owner_id))
             rows = cur.fetchall()
     return {r[0] for r in rows}
 
 
-def rename_chat(filename, new_title):
+def rename_chat(filename, new_title, owner_id=None):
     new_title = new_title.strip()
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE chats SET title = %s WHERE filename = %s",
-                (new_title if new_title else None, filename),
+                "UPDATE chats SET title = %s WHERE filename = %s AND (%s IS NULL OR owner_id = %s)",
+                (new_title if new_title else None, filename, owner_id, owner_id),
             )
         conn.commit()
 
 
-def get_chat_titles():
+def get_chat_titles(owner_id=None):
     """คืน dict {filename: title} เฉพาะแชทที่มีชื่อแล้ว (เอง หรืออัตโนมัติ)"""
     with _get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT filename, title FROM chats WHERE title IS NOT NULL")
+            cur.execute("SELECT filename, title FROM chats WHERE title IS NOT NULL AND (%s IS NULL OR owner_id = %s)", (owner_id, owner_id))
             rows = cur.fetchall()
     return {r[0]: r[1] for r in rows}
 

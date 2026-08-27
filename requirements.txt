@@ -3,12 +3,15 @@ pandas==2.2.2
 openpyxl==3.1.4
 google-generativeai
 google-genai
-streamlit
+streamlit==1.49.1
 pypdf
 python-docx
 python-pptx
 beautifulsoup4
 pillow
 pytesseract
+pdf2image
 psycopg2-binary
 pgvector
+fastembed==0.7.3
+numpy
