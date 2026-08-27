@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import time
 import hashlib
 import secrets
@@ -12,6 +13,13 @@ from google import genai
 from google.genai import types
 from prompt import SINGLE_MODE
 import db
+
+st.set_page_config(
+    page_title="Major.AI",
+    page_icon="💀",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 # ===== เตรียม path (ต้องมาก่อนเสมอ) =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,6 +155,23 @@ def save_chat():
     db.save_chat(st.session_state["current_chat"], st.session_state["messages"], _user_id())
 
 
+def restore_chat_mode(filename):
+    """โหลดโหมดของแชทจากฐานข้อมูล ไม่ใช้สถานะร่วมกันข้ามแชท."""
+    topic_slug, topic_name = db.get_chat_mode(filename, _user_id())
+    st.session_state["active_topic_slug"] = topic_slug
+    st.session_state["active_topic_name"] = topic_name
+    st.session_state["awaiting_topic_pick"] = False
+    st.session_state.pop("pending_web_query", None)
+
+
+def set_current_chat_mode(topic_slug=None, topic_name=None):
+    st.session_state["active_topic_slug"] = topic_slug
+    st.session_state["active_topic_name"] = topic_name
+    db.set_chat_mode(
+        st.session_state["current_chat"], topic_slug, topic_name, _user_id()
+    )
+
+
 def _now_str():
     return datetime.now().strftime("%d/%m/%Y %H:%M")
 
@@ -162,6 +187,7 @@ def new_chat():
         {"role": "model", "content": "Major.AI มึงจะถามอะไร", "timestamp": _now_str()}
     ]
     save_chat()
+    set_current_chat_mode()
     st.rerun()
 
 
@@ -405,6 +431,9 @@ st.session_state.setdefault("active_topic_name", None)
 st.session_state.setdefault("awaiting_topic_pick", False)
 st.session_state.setdefault("is_admin", False)
 st.session_state.setdefault("intro_dismissed", False)
+if st.session_state.get("mode_loaded_for_chat") != st.session_state["current_chat"]:
+    restore_chat_mode(st.session_state["current_chat"])
+    st.session_state["mode_loaded_for_chat"] = st.session_state["current_chat"]
 
 
 # ===== ปุ่ม login admin (ใน sidebar ใต้ชื่อบอท) =====
@@ -501,7 +530,11 @@ with st.sidebar:
 
     # ===== ส่วนจัดการหัวข้อความรู้ (admin เท่านั้น) =====
     # เช็คสิทธิ์ที่ระดับ logic ตรงนี้โดยตรง ไม่ได้ซ่อนแค่ UI เฉยๆ
-    if is_admin():
+    if is_admin() and st.toggle(
+        "📚 เปิดแผงจัดการ Knowledge",
+        value=False,
+        help="เปิดเมื่อต้องการสร้างหัวข้อ อัปโหลด หรือจัดการไฟล์",
+    ):
         st.divider()
         st.caption(f"⚙️ cache คำตอบ: {db.count_qa_cache()} รายการ")
         if st.button("🗑️ ล้าง cache คำตอบ"):
@@ -658,51 +691,50 @@ with st.sidebar:
 
             sources = db.list_sources(selected_slug)
             if sources:
-                st.caption(f"ไฟล์ในหัวข้อ '{topic_labels[selected_slug]}':")
-                for s in sources:
-                    col_src, col_src_menu = st.columns([5, 1])
-                    with col_src:
-                        st.caption(f"• {s}")
-                    with col_src_menu:
-                        with st.popover("⋮"):
-                            ext = os.path.splitext(s)[1].lower()
+                with st.expander(f"📁 ไฟล์ใน Knowledge ({len(sources)} ไฟล์)", expanded=False):
+                    s = st.selectbox(
+                        "เลือกไฟล์ที่ต้องการดูหรือจัดการ",
+                        sources,
+                        key=f"source_select_{selected_slug}",
+                    )
+                    ext = os.path.splitext(s)[1].lower()
 
-                            if ext in TEXT_EDITABLE_EXTS:
-                                current_text = db.get_source_text(selected_slug, s)
-                                edited_text = st.text_area(
-                                    "แก้ไขเนื้อหาไฟล์", value=current_text,
-                                    key=f"edit_text_{selected_slug}_{s}", height=150,
-                                )
-                                if st.button("💾 บันทึกการแก้ไข", key=f"save_edit_{selected_slug}_{s}") and is_admin():
-                                    try:
-                                        n = db.replace_source_text(selected_slug, s, edited_text)
-                                        st.success(f"บันทึกแล้ว ({n} chunks)")
-                                    except Exception as e:
-                                        st.error(f"บันทึกไม่สำเร็จ: {e}")
-                                    st.rerun()
-                                st.divider()
+                    if ext in TEXT_EDITABLE_EXTS:
+                        current_text = db.get_source_text(selected_slug, s)
+                        edited_text = st.text_area(
+                            "แก้ไขเนื้อหาไฟล์", value=current_text,
+                            key=f"edit_text_{selected_slug}_{s}", height=150,
+                        )
+                        if st.button("💾 บันทึกการแก้ไข", key=f"save_edit_{selected_slug}_{s}") and is_admin():
+                            try:
+                                n = db.replace_source_text(selected_slug, s, edited_text)
+                                st.success(f"บันทึกแล้ว ({n} chunks)")
+                            except Exception as e:
+                                st.error(f"บันทึกไม่สำเร็จ: {e}")
+                            st.rerun()
+                        st.divider()
 
-                            replace_upload = st.file_uploader(
-                                "แทนที่ไฟล์นี้ด้วยไฟล์ใหม่", key=f"replace_{selected_slug}_{s}"
-                            )
-                            if replace_upload and is_admin():
-                                r_ext = os.path.splitext(s)[1]
-                                with tempfile.NamedTemporaryFile(suffix=r_ext, delete=False) as tmp:
-                                    tmp.write(replace_upload.getbuffer())
-                                    tmp_path = tmp.name
-                                try:
-                                    n = db.replace_source_file(selected_slug, tmp_path, s)
-                                    st.success(f"แทนที่ไฟล์แล้ว ({n} chunks)")
-                                except Exception as e:
-                                    st.error(f"แทนที่ไฟล์ไม่สำเร็จ: {e}")
-                                finally:
-                                    os.remove(tmp_path)
-                                st.rerun()
+                    replace_upload = st.file_uploader(
+                        "แทนที่ไฟล์นี้ด้วยไฟล์ใหม่", key=f"replace_{selected_slug}_{s}"
+                    )
+                    if replace_upload and is_admin():
+                        r_ext = os.path.splitext(s)[1]
+                        with tempfile.NamedTemporaryFile(suffix=r_ext, delete=False) as tmp:
+                            tmp.write(replace_upload.getbuffer())
+                            tmp_path = tmp.name
+                        try:
+                            n = db.replace_source_file(selected_slug, tmp_path, s)
+                            st.success(f"แทนที่ไฟล์แล้ว ({n} chunks)")
+                        except Exception as e:
+                            st.error(f"แทนที่ไฟล์ไม่สำเร็จ: {e}")
+                        finally:
+                            os.remove(tmp_path)
+                        st.rerun()
 
-                            if st.button("🗑️ ลบไฟล์นี้", key=f"del_src_{selected_slug}_{s}") and is_admin():
-                                db.delete_source_file(selected_slug, s)
-                                st.success(f"ลบ '{s}' แล้ว")
-                                st.rerun()
+                    if st.button("🗑️ ลบไฟล์นี้", key=f"del_src_{selected_slug}_{s}") and is_admin():
+                        db.delete_source_file(selected_slug, s)
+                        st.success(f"ลบ '{s}' แล้ว")
+                        st.rerun()
 
     # ===== ประวัติแชท =====
     st.divider()
@@ -720,6 +752,8 @@ with st.sidebar:
             if st.button(f"{prefix}{label}", key=f"open_{chat_file}"):
                 st.session_state["current_chat"] = chat_file
                 st.session_state["messages"] = db.load_chat(chat_file, _user_id())
+                restore_chat_mode(chat_file)
+                st.session_state["mode_loaded_for_chat"] = chat_file
                 st.rerun()
         with col_menu:
             with st.popover("⋮"):
@@ -740,17 +774,34 @@ with st.sidebar:
                         if remaining:
                             st.session_state["current_chat"] = remaining[0]
                             st.session_state["messages"] = db.load_chat(remaining[0], _user_id())
+                            restore_chat_mode(remaining[0])
+                            st.session_state["mode_loaded_for_chat"] = remaining[0]
                         else:
                             st.session_state["current_chat"] = _new_chat_filename()
                             st.session_state["messages"] = [
                                 {"role": "model", "content": "Major.AI มึงจะถามอะไร", "timestamp": _now_str()}
                             ]
                             save_chat()
+                            set_current_chat_mode()
                     st.rerun()
 
 
 # ===== UI: header =====
-st.title("💀 กู Major.AI มีไร")
+st.markdown("""
+<style>
+    .block-container {max-width: 980px; padding-top: 1.4rem; padding-bottom: 7rem;}
+    [data-testid="stSidebar"] {border-right: 1px solid rgba(128,128,128,.18);}
+    [data-testid="stChatMessage"] {border-radius: 14px; padding: .35rem .7rem;}
+    .mode-card {padding: .75rem 1rem; border-radius: 12px; margin: .5rem 0 .8rem 0;}
+    .mode-knowledge {background: rgba(37,99,235,.10); border: 1px solid rgba(37,99,235,.32);}
+    .mode-general {background: rgba(16,185,129,.09); border: 1px solid rgba(16,185,129,.30);}
+    .mode-title {font-weight: 700; margin-bottom: .1rem;}
+    .mode-help {font-size: .84rem; opacity: .78;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("💀 Major.AI")
+st.caption("ถามทั่วไป หรือเลือก Knowledge เพื่อให้ตอบจากเอกสารเฉพาะเรื่อง")
 
 # ===== คำแนะนำการใช้งาน =====
 with st.expander("❓ วิธีใช้งาน", expanded=not st.session_state["intro_dismissed"]):
@@ -765,19 +816,6 @@ with st.expander("❓ วิธีใช้งาน", expanded=not st.session_s
         st.session_state["intro_dismissed"] = True
         st.rerun()
 
-# ===== สถานะหัวข้อ knowledge ที่ใช้งานอยู่ =====
-if st.session_state["active_topic_slug"]:
-    status_left, status_right = st.columns([6, 1])
-    with status_left:
-        st.caption(f"📚 กำลังใช้ knowledge: {st.session_state['active_topic_name']} (พิมพ์ / เพื่อเปลี่ยน)")
-    with status_right:
-        if st.button("✖ เลิกใช้", key="clear_topic_btn"):
-            st.session_state["active_topic_slug"] = None
-            st.session_state["active_topic_name"] = None
-            st.rerun()
-else:
-    st.caption("💬 โหมดทั่วไป (เชื่อมเน็ตได้) — พิมพ์ / เพื่อเลือกใช้ knowledge")
-
 for msg in st.session_state["messages"]:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
@@ -791,23 +829,28 @@ if st.session_state["awaiting_topic_pick"]:
     if filter_text:
         topics = [t for t in topics if filter_text in t["name"].lower()]
 
-    st.info("เลือกหัวข้อ knowledge ที่จะใช้ 👇")
-
-    if st.button("🚫 ไม่ใช้ knowledge (คุยทั่วไป)", key="pick_none"):
-        st.session_state["active_topic_slug"] = None
-        st.session_state["active_topic_name"] = None
-        st.session_state["awaiting_topic_pick"] = False
-        st.rerun()
-
     if not topics:
         st.caption("ไม่พบหัวข้อที่ตรงกัน" if filter_text else "ยังไม่มีหัวข้อ knowledge ให้เลือก (ให้ admin สร้างก่อน)")
-
-    for t in topics:
-        if st.button(f"📚 {t['name']}", key=f"pick_{t['slug']}"):
-            st.session_state["active_topic_slug"] = t["slug"]
-            st.session_state["active_topic_name"] = t["name"]
-            st.session_state["awaiting_topic_pick"] = False
-            st.rerun()
+    else:
+        with st.container(border=True):
+            st.markdown("#### เลือก Knowledge")
+            topic_by_slug = {t["slug"]: t["name"] for t in topics}
+            picked_slug = st.selectbox(
+                "ค้นหาและเลือกหัวข้อ",
+                options=list(topic_by_slug),
+                format_func=lambda slug: f"📚 {topic_by_slug[slug]}",
+                key="chat_topic_picker",
+            )
+            pick_col, cancel_col = st.columns(2)
+            with pick_col:
+                if st.button("ใช้หัวข้อนี้", type="primary", use_container_width=True):
+                    set_current_chat_mode(picked_slug, topic_by_slug[picked_slug])
+                    st.session_state["awaiting_topic_pick"] = False
+                    st.rerun()
+            with cancel_col:
+                if st.button("ยกเลิก", use_container_width=True):
+                    st.session_state["awaiting_topic_pick"] = False
+                    st.rerun()
 
 pending_web_query = st.session_state.get("pending_web_query")
 if pending_web_query:
@@ -823,7 +866,31 @@ if pending_web_query:
             st.session_state.pop("pending_web_query", None)
             st.rerun()
 
-if prompt := st.chat_input("พิมพ์คำถาม หรือ / เพื่อเลือก knowledge"):
+# แถบนี้อยู่ชิดเหนือช่องพิมพ์ เพื่อให้รู้โหมดก่อนส่งทุกคำถาม
+if st.session_state["active_topic_slug"]:
+    mode_col, action_col = st.columns([5, 1.35], vertical_alignment="center")
+    with mode_col:
+        safe_topic_name = html.escape(st.session_state["active_topic_name"] or "")
+        st.markdown(
+            f'<div class="mode-card mode-knowledge"><div class="mode-title">📚 Knowledge: '
+            f'{safe_topic_name}</div>'
+            '<div class="mode-help">คำตอบจะยึดข้อมูลจากหัวข้อนี้ · พิมพ์ / เพื่อเปลี่ยนหัวข้อ</div></div>',
+            unsafe_allow_html=True,
+        )
+    with action_col:
+        if st.button("กลับโหมดทั่วไป", key="clear_topic_btn", use_container_width=True):
+            set_current_chat_mode()
+            st.rerun()
+    input_placeholder = f"ถามจาก Knowledge: {st.session_state['active_topic_name']}"
+else:
+    st.markdown(
+        '<div class="mode-card mode-general"><div class="mode-title">💬 โหมดแชททั่วไป</div>'
+        '<div class="mode-help">ถามได้ทุกเรื่อง · พิมพ์ / เพื่อเลือก Knowledge</div></div>',
+        unsafe_allow_html=True,
+    )
+    input_placeholder = "พิมพ์คำถาม หรือ / เพื่อเลือก Knowledge"
+
+if prompt := st.chat_input(input_placeholder):
     stripped = prompt.strip()
     if stripped.startswith("/"):
         st.session_state["awaiting_topic_pick"] = True

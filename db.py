@@ -192,6 +192,8 @@ def _setup_schema():
                 );
             """)
             cur.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS owner_id BIGINT REFERENCES users(id) ON DELETE CASCADE")
+            cur.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS active_topic_slug TEXT REFERENCES topics(slug) ON DELETE SET NULL")
+            cur.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS active_topic_name TEXT")
             cur.execute("CREATE INDEX IF NOT EXISTS chats_owner_idx ON chats(owner_id, pinned, filename)")
             cur.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS knowledge_version BIGINT NOT NULL DEFAULT 1")
             cur.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS embedding_profile TEXT NOT NULL DEFAULT %s", (LOCAL_PROFILE,))
@@ -873,6 +875,32 @@ def save_chat(filename, messages, owner_id=None):
                     "VALUES (%s, %s, %s, %s, %s)",
                     (filename, msg["role"], msg["content"], msg.get("timestamp"), i),
                 )
+        conn.commit()
+
+
+def get_chat_mode(filename, owner_id=None):
+    """คืนค่า Knowledge ที่ผูกกับแชท หรือโหมดทั่วไปถ้าไม่มีหัวข้อ."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.active_topic_slug, COALESCE(t.name, c.active_topic_name) "
+                "FROM chats c LEFT JOIN topics t ON t.slug = c.active_topic_slug "
+                "WHERE c.filename = %s AND (%s IS NULL OR c.owner_id = %s)",
+                (filename, owner_id, owner_id),
+            )
+            row = cur.fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def set_chat_mode(filename, topic_slug, topic_name, owner_id=None):
+    """บันทึกโหมดแยกต่อแชท เพื่อให้คงอยู่หลัง logout/reboot/เปลี่ยนอุปกรณ์."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE chats SET active_topic_slug = %s, active_topic_name = %s "
+                "WHERE filename = %s AND (%s IS NULL OR owner_id = %s)",
+                (topic_slug, topic_name, filename, owner_id, owner_id),
+            )
         conn.commit()
 
 
