@@ -626,8 +626,12 @@ def search_with_sources(topic_slug, query, top_k=5, min_score=0.28):
     """Return relevant chunks using semantic retrieval plus exact-term boosting."""
     provider = get_embedding_provider()
     normalized_query = _normalize_retrieval_query(query)
-    query_emb = provider.embed_query(normalized_query)
-    candidate_limit = max(top_k * 3, 24)
+    # Preserve the user's natural wording for semantic similarity. Expanded terms
+    # are used by the lexical branch below instead of diluting the query embedding.
+    semantic_query = re.sub(r"\s+", " ", str(query or "").strip())
+    query_emb = provider.embed_query(semantic_query)
+    exact_terms = _extract_retrieval_terms(normalized_query)
+    candidate_limit = max(top_k * 8, 40)
     with _get_vector_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -637,9 +641,36 @@ def search_with_sources(topic_slug, query, top_k=5, min_score=0.28):
                 (Vector(query_emb), topic_slug, provider.profile, Vector(query_emb), candidate_limit),
             )
             rows = cur.fetchall()
-    exact_terms = _extract_retrieval_terms(normalized_query)
-    ranked = []
+            # Semantic search can miss an exact Thai heading. Fetch direct term
+            # matches as a second candidate set, then rerank both sets together.
+            lexical_terms = sorted(
+                (term for term in exact_terms if term != "c" and len(term) >= 3),
+                key=len,
+                reverse=True,
+            )[:14]
+            if lexical_terms:
+                conditions = " OR ".join("content ILIKE %s" for _ in lexical_terms)
+                patterns = [f"%{term}%" for term in lexical_terms]
+                cur.execute(
+                    "SELECT content, source, location_metadata, 1 - (embedding <=> %s) AS score "
+                    "FROM documents_v2 WHERE topic_slug = %s AND embedding_profile = %s "
+                    f"AND ({conditions}) ORDER BY embedding <=> %s LIMIT %s",
+                    (
+                        Vector(query_emb), topic_slug, provider.profile,
+                        *patterns, Vector(query_emb), candidate_limit,
+                    ),
+                )
+                rows.extend(cur.fetchall())
+    unique_rows = []
+    seen_rows = set()
     for row in rows:
+        metadata_key = json.dumps(row[2], ensure_ascii=False, sort_keys=True) if isinstance(row[2], dict) else str(row[2])
+        row_key = (row[0], row[1], metadata_key)
+        if row_key not in seen_rows:
+            seen_rows.add(row_key)
+            unique_rows.append(row)
+    ranked = []
+    for row in unique_rows:
         semantic_score = float(row[3])
         lexical_boost, lexical_coverage = _lexical_relevance(row[0], exact_terms)
         score = semantic_score + lexical_boost
