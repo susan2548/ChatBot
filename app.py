@@ -323,6 +323,32 @@ def _append_web_sources(answer, sources):
     return f"{answer}\n\n**แหล่งข้อมูลจากอินเทอร์เน็ต**\n{links}"
 
 
+def _is_knowledge_file_list_request(prompt):
+    """Detect requests for uploaded source filenames, not document content."""
+    text = re.sub(r"\s+", " ", str(prompt or "").strip().lower())
+    asks_for_files = any(term in text for term in (
+        "มีไฟล์อะไร", "ไฟล์อะไรบ้าง", "รายชื่อไฟล์", "ชื่อไฟล์ทั้งหมด",
+        "ไฟล์ทั้งหมด", "อัปโหลดไฟล์อะไร", "อัพโหลดไฟล์อะไร",
+        "uploaded files", "list files", "source files",
+    ))
+    asks_for_knowledge = any(term in text for term in (
+        "knowledge", "dataset", "data set", "ฐานความรู้", "ชุดข้อมูล", "อัปโหลด", "อัพโหลด",
+    ))
+    asks_for_all = any(term in text for term in ("ทั้งหมด", "ทุกไฟล์", "ครบ", "all"))
+    return asks_for_files and (asks_for_knowledge or asks_for_all)
+
+
+def _knowledge_file_list_answer(topic_name, filenames):
+    unique_filenames = sorted(dict.fromkeys(str(name) for name in filenames if name))
+    if not unique_filenames:
+        return f"Knowledge ‘{topic_name}’ ยังไม่มีไฟล์ที่อัปโหลดไว้"
+    items = "\n".join(
+        f"{index}. `{filename.replace('`', '')}`"
+        for index, filename in enumerate(unique_filenames, start=1)
+    )
+    return f"Knowledge ‘{topic_name}’ มีไฟล์ที่อัปโหลดไว้ทั้งหมด {len(unique_filenames)} ไฟล์:\n\n{items}"
+
+
 def generate_response(prompt, force_web=False):
     """RAG-first response with citations and explicit web fallback."""
     topic_slug = st.session_state.get("active_topic_slug")
@@ -332,6 +358,14 @@ def generate_response(prompt, force_web=False):
     system_instruction = SINGLE_MODE["prompt"]
 
     if topic_slug and not force_web:
+        if _is_knowledge_file_list_request(prompt):
+            answer = _knowledge_file_list_answer(topic_name, db.list_sources(topic_slug))
+            st.chat_message("model").write(answer)
+            st.session_state["messages"].append(
+                {"role": "model", "content": answer, "timestamp": _now_str()}
+            )
+            return
+
         retrieved = db.search_with_sources(topic_slug, prompt, top_k=8, min_score=0.28)
         if not retrieved:
             answer = (
