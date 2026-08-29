@@ -14,8 +14,12 @@ class FakeError(Exception):
 
 
 class GenerationUtilsTests(unittest.TestCase):
-    def test_default_chain_uses_flash_then_flash_lite(self):
+    def test_default_chain_uses_flash_then_current_flash_lite(self):
         self.assertEqual(parse_generation_models(), DEFAULT_GENERATION_MODELS)
+        self.assertEqual(
+            DEFAULT_GENERATION_MODELS,
+            ("gemini-2.5-flash", "gemini-3.5-flash-lite"),
+        )
 
     def test_configured_chain_is_trimmed_and_deduplicated(self):
         self.assertEqual(
