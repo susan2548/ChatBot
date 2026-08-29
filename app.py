@@ -12,6 +12,12 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from prompt import SINGLE_MODE
+from generation_utils import (
+    is_model_quota_error,
+    is_model_unavailable_error,
+    is_transient_generation_error,
+    parse_generation_models,
+)
 import db
 
 st.set_page_config(
@@ -60,6 +66,7 @@ def is_admin() -> bool:
 
 
 client = genai.Client(api_key=api_key)
+GENERATION_MODELS = parse_generation_models(get_config("GEMINI_MODELS"))
 db.init_db(database_url, api_key)  # ต่อ Neon + สร้างตารางถ้ายังไม่มี
 db.ensure_admin_user(ADMIN_PASSWORD)
 
@@ -140,35 +147,45 @@ def _wait_for_rate_slot():
         waited += 1
 
 
-def _is_transient_generation_error(exc):
-    message = f"{type(exc).__name__}: {exc}".lower()
-    return any(marker in message for marker in (
-        "429", "500", "502", "503", "504", "resource_exhausted",
-        "unavailable", "deadline", "timeout", "temporarily", "connection reset",
-    ))
-
-
-def _generate_content_with_retry(contents, config, max_attempts=3):
-    """Retry temporary provider failures and count each retry against the local rate limit."""
+def _generate_content_with_fallback(contents, config, max_attempts_per_model=2):
+    """Try each model in order; quota exhaustion switches models without same-model retries."""
     last_error = None
-    for attempt in range(max_attempts):
-        if not _wait_for_rate_slot():
-            raise _RateQueueFullError("local request queue is full")
-        try:
-            return client.models.generate_content(
-                model="gemini-2.5-flash", contents=contents, config=config
-            )
-        except Exception as exc:
-            last_error = exc
-            if not _is_transient_generation_error(exc) or attempt == max_attempts - 1:
-                raise
-            wait_seconds = 1.5 * (2 ** attempt)
-            print(
-                f"[Major.AI] transient generate_content error; retry {attempt + 2}/{max_attempts} "
-                f"in {wait_seconds:.1f}s: {type(exc).__name__}: {exc}"
-            )
-            time.sleep(wait_seconds)
-    raise last_error
+    for model_index, model_name in enumerate(GENERATION_MODELS):
+        for attempt in range(max_attempts_per_model):
+            if not _wait_for_rate_slot():
+                raise _RateQueueFullError("local request queue is full")
+            try:
+                response = client.models.generate_content(
+                    model=model_name, contents=contents, config=config
+                )
+                if model_index:
+                    print(f"[Major.AI] fallback model succeeded: {model_name}")
+                return response, model_name
+            except Exception as exc:
+                last_error = exc
+                if is_model_quota_error(exc) or is_model_unavailable_error(exc):
+                    next_model = (
+                        GENERATION_MODELS[model_index + 1]
+                        if model_index + 1 < len(GENERATION_MODELS)
+                        else "none"
+                    )
+                    print(
+                        f"[Major.AI] model unavailable: {model_name}; next={next_model}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    break
+                if not is_transient_generation_error(exc) or attempt == max_attempts_per_model - 1:
+                    raise
+                wait_seconds = 1.5 * (2 ** attempt)
+                print(
+                    f"[Major.AI] transient error on {model_name}; retry "
+                    f"{attempt + 2}/{max_attempts_per_model} in {wait_seconds:.1f}s: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                time.sleep(wait_seconds)
+    if last_error:
+        raise last_error
+    raise RuntimeError("no Gemini generation models configured")
 
 
 # ===== ฟังก์ชันจัดการประวัติแชท =====
@@ -457,10 +474,11 @@ def generate_response(prompt, force_web=False):
     with st.chat_message("model"):
         with st.status("Major.AI กำลังค้นและเรียบเรียงคำตอบ...", expanded=False) as status:
             try:
-                response = _generate_content_with_retry(history, config)
+                response, model_used = _generate_content_with_fallback(history, config)
                 answer = response.text
                 if force_web or not topic_slug:
                     answer = _append_web_sources(answer, _web_sources_from_response(response))
+                print(f"[Major.AI] generation model used: {model_used}")
                 status.update(label="ตอบเสร็จแล้ว", state="complete")
             except _RateQueueFullError:
                 answer = "มีผู้ใช้งานพร้อมกันจำนวนมาก กรุณารอสักครู่แล้วลองใหม่"
