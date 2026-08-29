@@ -120,6 +120,10 @@ RATE_LIMIT_WINDOW = 60    # วินาที
 RATE_LIMIT_MAX_WAIT = 20  # รอคิวได้สูงสุดกี่วินาที ก่อนจะบอกให้ผู้ใช้ลองใหม่เอง
 
 
+class _RateQueueFullError(RuntimeError):
+    pass
+
+
 def _wait_for_rate_slot():
     """รอคิวสั้นๆ ถ้าตอนนี้มีคนใช้เยอะ กันยิง request ชนโควตา Gemini API จนโดน 429"""
     waited = 0
@@ -134,6 +138,37 @@ def _wait_for_rate_slot():
             return False
         time.sleep(1)
         waited += 1
+
+
+def _is_transient_generation_error(exc):
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in message for marker in (
+        "429", "500", "502", "503", "504", "resource_exhausted",
+        "unavailable", "deadline", "timeout", "temporarily", "connection reset",
+    ))
+
+
+def _generate_content_with_retry(contents, config, max_attempts=3):
+    """Retry temporary provider failures and count each retry against the local rate limit."""
+    last_error = None
+    for attempt in range(max_attempts):
+        if not _wait_for_rate_slot():
+            raise _RateQueueFullError("local request queue is full")
+        try:
+            return client.models.generate_content(
+                model="gemini-2.5-flash", contents=contents, config=config
+            )
+        except Exception as exc:
+            last_error = exc
+            if not _is_transient_generation_error(exc) or attempt == max_attempts - 1:
+                raise
+            wait_seconds = 1.5 * (2 ** attempt)
+            print(
+                f"[Major.AI] transient generate_content error; retry {attempt + 2}/{max_attempts} "
+                f"in {wait_seconds:.1f}s: {type(exc).__name__}: {exc}"
+            )
+            time.sleep(wait_seconds)
+    raise last_error
 
 
 # ===== ฟังก์ชันจัดการประวัติแชท =====
@@ -421,22 +456,19 @@ def generate_response(prompt, force_web=False):
     )
     with st.chat_message("model"):
         with st.status("Major.AI กำลังค้นและเรียบเรียงคำตอบ...", expanded=False) as status:
-            if not _wait_for_rate_slot():
-                answer = "คิวคำถามเต็มชั่วคราว กรุณาลองใหม่อีกครั้ง"
+            try:
+                response = _generate_content_with_retry(history, config)
+                answer = response.text
+                if force_web or not topic_slug:
+                    answer = _append_web_sources(answer, _web_sources_from_response(response))
+                status.update(label="ตอบเสร็จแล้ว", state="complete")
+            except _RateQueueFullError:
+                answer = "มีผู้ใช้งานพร้อมกันจำนวนมาก กรุณารอสักครู่แล้วลองใหม่"
                 status.update(label="คิวเต็ม", state="error")
-            else:
-                try:
-                    response = client.models.generate_content(
-                        model="gemini-2.5-flash", contents=history, config=config
-                    )
-                    answer = response.text
-                    if force_web or not topic_slug:
-                        answer = _append_web_sources(answer, _web_sources_from_response(response))
-                    status.update(label="ตอบเสร็จแล้ว", state="complete")
-                except Exception as exc:
-                    print(f"[Major.AI] generate_content error: {type(exc).__name__}: {exc}")
-                    answer = "ระบบ AI มีปัญหาชั่วคราว กรุณาลองใหม่อีกครั้ง"
-                    status.update(label="เกิดข้อผิดพลาด", state="error")
+            except Exception as exc:
+                print(f"[Major.AI] generate_content error after retries: {type(exc).__name__}: {exc}")
+                answer = "ผู้ให้บริการ AI ขัดข้องชั่วคราว ระบบลองใหม่แล้วแต่ยังไม่สำเร็จ กรุณารอสักครู่"
+                status.update(label="เกิดข้อผิดพลาด", state="error")
         st.write(answer)
         if retrieved:
             with st.expander(f"แหล่งอ้างอิงจาก Knowledge ({len(retrieved)})"):
