@@ -28,6 +28,12 @@ from google.genai import types
 # ใช้ฟังก์ชันอ่านไฟล์/ตัด chunk ตัวเดียวกับ rag.py (ไม่ผูกกับ ChromaDB เลย เอามาใช้ซ้ำได้ปลอดภัย)
 from rag import read_file, chunk_text, build_chunks, iter_chunks, SUPPORTED_EXTS, ZIP_EXT
 from embedding_service import get_embedding_provider, LOCAL_DIMENSION, LOCAL_PROFILE
+from retrieval_utils import (
+    extract_retrieval_terms,
+    lexical_relevance,
+    normalize_retrieval_query,
+    retrieval_topic_key,
+)
 
 EMBED_DIM = 768  # pgvector index (hnsw/ivfflat) รองรับสูงสุด 2000 มิติ เลยตัด gemini-embedding-001 ลงมาที่ 768
 EMBED_BATCH_SIZE = 100  # Gemini embedContent รับได้สูงสุด 100 รายการต่อ batch
@@ -601,19 +607,22 @@ def search(topic_slug, query, top_k=4):
 
 
 def _normalize_retrieval_query(query):
-    normalized = re.sub(r"\s+", " ", query.strip())
-    replacements = {
-        r"\bif\s*else\b": "if else conditional statement เงื่อนไข",
-        r"\bfor\s*loop\b": "for loop วนซ้ำ",
-        r"\bwhile\s*loop\b": "while loop วนซ้ำ",
-        r"\bswitch\s*case\b": "switch case เงื่อนไข",
-    }
-    for pattern, replacement in replacements.items():
-        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
-    return normalized
+    return normalize_retrieval_query(query)
 
 
-def search_with_sources(topic_slug, query, top_k=8, min_score=0.28):
+def _extract_retrieval_terms(query):
+    return extract_retrieval_terms(query)
+
+
+def _lexical_relevance(content, terms):
+    return lexical_relevance(content, terms)
+
+
+def _retrieval_topic_key(content):
+    return retrieval_topic_key(content)
+
+
+def search_with_sources(topic_slug, query, top_k=5, min_score=0.28):
     """Return relevant chunks using semantic retrieval plus exact-term boosting."""
     provider = get_embedding_provider()
     normalized_query = _normalize_retrieval_query(query)
@@ -628,16 +637,11 @@ def search_with_sources(topic_slug, query, top_k=8, min_score=0.28):
                 (Vector(query_emb), topic_slug, provider.profile, Vector(query_emb), candidate_limit),
             )
             rows = cur.fetchall()
-    exact_terms = {
-        term.lower() for term in re.findall(r"[A-Za-z_][A-Za-z0-9_+#.-]*", normalized_query)
-        if len(term) >= 2
-    }
+    exact_terms = _extract_retrieval_terms(normalized_query)
     ranked = []
     for row in rows:
         semantic_score = float(row[3])
-        lowered_content = row[0].lower()
-        matched_terms = sum(1 for term in exact_terms if term in lowered_content)
-        lexical_boost = min(0.15, matched_terms * 0.05)
+        lexical_boost, lexical_coverage = _lexical_relevance(row[0], exact_terms)
         score = semantic_score + lexical_boost
         metadata = row[2] if isinstance(row[2], dict) else json.loads(row[2] or "{}")
         ranked.append({
@@ -646,12 +650,29 @@ def search_with_sources(topic_slug, query, top_k=8, min_score=0.28):
             "location": metadata.get("location", "เนื้อหา"),
             "score": score,
             "semantic_score": semantic_score,
+            "lexical_coverage": lexical_coverage,
         })
     ranked.sort(key=lambda item: item["score"], reverse=True)
     if not ranked or ranked[0]["score"] < min_score:
         return []
-    adaptive_floor = max(0.24, ranked[0]["score"] - 0.18)
-    results = [item for item in ranked if item["score"] >= adaptive_floor][:top_k]
+    adaptive_floor = max(0.26, ranked[0]["score"] - 0.11)
+    results = []
+    seen_content = set()
+    topic_counts = {}
+    for item in ranked:
+        if item["score"] < adaptive_floor:
+            continue
+        content_key = re.sub(r"\s+", " ", item["content"].lower()).strip()
+        if content_key in seen_content:
+            continue
+        topic_key = _retrieval_topic_key(item["content"])
+        if topic_counts.get(topic_key, 0) >= 2:
+            continue
+        seen_content.add(content_key)
+        topic_counts[topic_key] = topic_counts.get(topic_key, 0) + 1
+        results.append(item)
+        if len(results) >= top_k:
+            break
     for index, item in enumerate(results, start=1):
         item["citation_id"] = f"D{index}"
     return results

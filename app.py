@@ -366,7 +366,7 @@ def generate_response(prompt, force_web=False):
             )
             return
 
-        retrieved = db.search_with_sources(topic_slug, prompt, top_k=8, min_score=0.28)
+        retrieved = db.search_with_sources(topic_slug, prompt, top_k=5, min_score=0.28)
         if not retrieved:
             answer = (
                 f"ไม่พบข้อมูลที่เกี่ยวข้องเพียงพอใน knowledge ‘{topic_name}’ "
