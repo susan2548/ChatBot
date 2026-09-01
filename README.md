@@ -33,3 +33,23 @@ renders returned web sources.
 ## Tests
 
 Run `python -m unittest discover -s tests` after installing dependencies.
+
+## Performance behavior
+
+- Streamlit initializes the database schema, admin bootstrap, Gemini client,
+  rate limiter, and ingestion lock once per server process.
+- A normal rerun fetches chat title, pin, and Knowledge mode metadata in one
+  sidebar query. Admin user/Knowledge data is loaded only when its panel opens.
+- Opening a chat loads the latest 50 messages; older pages are loaded on demand.
+- New messages are appended atomically instead of deleting and rewriting the
+  entire conversation.
+- Successful answers stream to the UI and are cached. General answers expire
+  from use after 24 hours; Knowledge answers are invalidated when sources change.
+- Only one local embedding ingestion task can run at a time, preventing multiple
+  admin uploads from exhausting the shared Streamlit CPU.
+
+Admins can inspect the latest server-side preparation, retrieval, Gemini, and
+save timings in **ประสิทธิภาพล่าสุด** in the sidebar. Community Cloud cold-start
+time is platform-controlled and is separate from these warm-run timings.
+The before/after implementation record and a live-test table are available in
+[`PERFORMANCE_REPORT.md`](PERFORMANCE_REPORT.md).

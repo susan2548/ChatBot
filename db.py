@@ -187,6 +187,20 @@ def _setup_schema():
                 );
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS chat_messages_chat_idx ON chat_messages(chat_filename, seq);")
+            # Older versions rewrote the whole chat and did not enforce sequence
+            # uniqueness. Keep the oldest copy if a previous concurrent write
+            # produced duplicate sequence numbers, then enforce the invariant.
+            cur.execute("""
+                DELETE FROM chat_messages newer
+                USING chat_messages older
+                WHERE newer.chat_filename = older.chat_filename
+                  AND newer.seq = older.seq
+                  AND newer.id > older.id
+            """)
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_chat_seq_unique "
+                "ON chat_messages(chat_filename, seq)"
+            )
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS qa_cache (
@@ -203,6 +217,9 @@ def _setup_schema():
             cur.execute("CREATE INDEX IF NOT EXISTS chats_owner_idx ON chats(owner_id, pinned, filename)")
             cur.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS knowledge_version BIGINT NOT NULL DEFAULT 1")
             cur.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS embedding_profile TEXT NOT NULL DEFAULT %s", (LOCAL_PROFILE,))
+            cur.execute(
+                "ALTER TABLE qa_cache ADD COLUMN IF NOT EXISTS sources JSONB NOT NULL DEFAULT '[]'::jsonb"
+            )
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS documents_v2 (
                     id BIGSERIAL PRIMARY KEY,
@@ -622,27 +639,24 @@ def _retrieval_topic_key(content):
     return retrieval_topic_key(content)
 
 
-def search_with_sources(topic_slug, query, top_k=5, min_score=0.28):
+def search_with_sources(topic_slug, query, top_k=5, min_score=0.28, timing_out=None):
     """Return relevant chunks using semantic retrieval plus exact-term boosting."""
     provider = get_embedding_provider()
     normalized_query = _normalize_retrieval_query(query)
     # Preserve the user's natural wording for semantic similarity. Expanded terms
     # are used by the lexical branch below instead of diluting the query embedding.
     semantic_query = re.sub(r"\s+", " ", str(query or "").strip())
+    embed_started = time.perf_counter()
     query_emb = provider.embed_query(semantic_query)
+    embed_ms = (time.perf_counter() - embed_started) * 1000
     exact_terms = _extract_retrieval_terms(normalized_query)
     candidate_limit = max(top_k * 8, 40)
+    database_started = time.perf_counter()
     with _get_vector_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT content, source, location_metadata, 1 - (embedding <=> %s) AS score "
-                "FROM documents_v2 WHERE topic_slug = %s AND embedding_profile = %s "
-                "ORDER BY embedding <=> %s LIMIT %s",
-                (Vector(query_emb), topic_slug, provider.profile, Vector(query_emb), candidate_limit),
-            )
-            rows = cur.fetchall()
             # Semantic search can miss an exact Thai heading. Fetch direct term
-            # matches as a second candidate set, then rerank both sets together.
+            # matches as a second candidate set. Both candidate sets are fetched
+            # in one database round trip and reranked together below.
             lexical_terms = sorted(
                 (term for term in exact_terms if term != "c" and len(term) >= 3),
                 key=len,
@@ -652,15 +666,36 @@ def search_with_sources(topic_slug, query, top_k=5, min_score=0.28):
                 conditions = " OR ".join("content ILIKE %s" for _ in lexical_terms)
                 patterns = [f"%{term}%" for term in lexical_terms]
                 cur.execute(
+                    "WITH semantic_candidates AS ("
                     "SELECT content, source, location_metadata, 1 - (embedding <=> %s) AS score "
                     "FROM documents_v2 WHERE topic_slug = %s AND embedding_profile = %s "
-                    f"AND ({conditions}) ORDER BY embedding <=> %s LIMIT %s",
+                    "ORDER BY embedding <=> %s LIMIT %s"
+                    "), lexical_candidates AS ("
+                    "SELECT content, source, location_metadata, 1 - (embedding <=> %s) AS score "
+                    "FROM documents_v2 WHERE topic_slug = %s AND embedding_profile = %s "
+                    f"AND ({conditions}) ORDER BY embedding <=> %s LIMIT %s"
+                    ") SELECT content, source, location_metadata, score FROM semantic_candidates "
+                    "UNION ALL SELECT content, source, location_metadata, score FROM lexical_candidates",
                     (
+                        Vector(query_emb), topic_slug, provider.profile, Vector(query_emb), candidate_limit,
                         Vector(query_emb), topic_slug, provider.profile,
                         *patterns, Vector(query_emb), candidate_limit,
                     ),
                 )
-                rows.extend(cur.fetchall())
+            else:
+                cur.execute(
+                    "SELECT content, source, location_metadata, 1 - (embedding <=> %s) AS score "
+                    "FROM documents_v2 WHERE topic_slug = %s AND embedding_profile = %s "
+                    "ORDER BY embedding <=> %s LIMIT %s",
+                    (Vector(query_emb), topic_slug, provider.profile, Vector(query_emb), candidate_limit),
+                )
+            rows = cur.fetchall()
+    database_ms = (time.perf_counter() - database_started) * 1000
+    if timing_out is not None:
+        timing_out.update({
+            "embedding_ms": round(embed_ms, 1),
+            "database_ms": round(database_ms, 1),
+        })
     unique_rows = []
     seen_rows = set()
     for row in rows:
@@ -894,6 +929,36 @@ def list_chats(owner_id=None):
     return [r[0] for r in rows]
 
 
+def list_chat_summaries(owner_id=None):
+    """Return all sidebar metadata in one query.
+
+    This replaces separate list/title/pin/mode queries on every Streamlit
+    rerun.  The topic display name follows the current topic name when it was
+    renamed, while keeping the saved fallback for deleted/legacy topics.
+    """
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.filename, c.title, c.pinned, c.active_topic_slug, "
+                "COALESCE(t.name, c.active_topic_name) "
+                "FROM chats c LEFT JOIN topics t ON t.slug = c.active_topic_slug "
+                "WHERE (%s IS NULL OR c.owner_id = %s) "
+                "ORDER BY c.pinned DESC, c.filename DESC",
+                (owner_id, owner_id),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "filename": row[0],
+            "title": row[1],
+            "pinned": bool(row[2]),
+            "topic_slug": row[3],
+            "topic_name": row[4],
+        }
+        for row in rows
+    ]
+
+
 def load_chat(filename, owner_id=None):
     with _get_conn() as conn:
         with conn.cursor() as cur:
@@ -905,6 +970,30 @@ def load_chat(filename, owner_id=None):
             )
             rows = cur.fetchall()
     return [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]
+
+
+def load_chat_page(filename, owner_id=None, limit=50, before_seq=None):
+    """Load a newest-first page, returned in normal chronological order."""
+    limit = max(1, min(int(limit), 200))
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT m.role, m.content, m.timestamp, m.seq "
+                "FROM chat_messages m JOIN chats c ON c.filename = m.chat_filename "
+                "WHERE m.chat_filename = %s AND (%s IS NULL OR c.owner_id = %s) "
+                "AND (%s IS NULL OR m.seq < %s) "
+                "ORDER BY m.seq DESC LIMIT %s",
+                (filename, owner_id, owner_id, before_seq, before_seq, limit + 1),
+            )
+            rows = cur.fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    oldest_seq = rows[-1][3] if rows else None
+    messages = [
+        {"role": row[0], "content": row[1], "timestamp": row[2]}
+        for row in reversed(rows)
+    ]
+    return messages, has_more, oldest_seq
 
 
 def save_chat(filename, messages, owner_id=None):
@@ -928,6 +1017,55 @@ def save_chat(filename, messages, owner_id=None):
                     (filename, msg["role"], msg["content"], msg.get("timestamp"), i),
                 )
         conn.commit()
+
+
+def append_chat_messages(filename, messages, owner_id=None):
+    """Append new messages atomically without rewriting the chat history.
+
+    Locking the parent chat row serializes writers from multiple browser tabs.
+    The unique database index on ``(chat_filename, seq)`` is a final guard
+    against duplicate sequence numbers.
+    """
+    if not messages:
+        return 0
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chats (filename, owner_id) VALUES (%s, %s) "
+                "ON CONFLICT (filename) DO NOTHING",
+                (filename, owner_id),
+            )
+            cur.execute(
+                "SELECT owner_id FROM chats WHERE filename = %s FOR UPDATE",
+                (filename,),
+            )
+            chat_owner = cur.fetchone()
+            if owner_id is not None and (not chat_owner or chat_owner[0] != owner_id):
+                raise PermissionError("ไม่มีสิทธิ์แก้ไขแชทนี้")
+            cur.execute(
+                "SELECT COALESCE(MAX(seq), -1) + 1 FROM chat_messages WHERE chat_filename = %s",
+                (filename,),
+            )
+            first_seq = cur.fetchone()[0]
+            rows = [
+                (
+                    filename,
+                    msg["role"],
+                    msg["content"],
+                    msg.get("timestamp"),
+                    first_seq + offset,
+                )
+                for offset, msg in enumerate(messages)
+            ]
+            psycopg2.extras.execute_batch(
+                cur,
+                "INSERT INTO chat_messages "
+                "(chat_filename, role, content, timestamp, seq) VALUES (%s, %s, %s, %s, %s)",
+                rows,
+                page_size=50,
+            )
+        conn.commit()
+    return len(messages)
 
 
 def get_chat_mode(filename, owner_id=None):
@@ -1008,22 +1146,36 @@ def get_chat_titles(owner_id=None):
 
 
 # ===== cache คำตอบ =====
-def get_cached_answer(cache_key):
+def get_cached_answer(cache_key, max_age_hours=None):
     with _get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT answer FROM qa_cache WHERE cache_key = %s", (cache_key,))
+            if max_age_hours is None:
+                cur.execute("SELECT answer, sources FROM qa_cache WHERE cache_key = %s", (cache_key,))
+            else:
+                cur.execute(
+                    "SELECT answer, sources FROM qa_cache WHERE cache_key = %s "
+                    "AND created_at >= now() - (%s * interval '1 hour')",
+                    (cache_key, float(max_age_hours)),
+                )
             row = cur.fetchone()
-    return row[0] if row else None
+    return {"answer": row[0], "sources": row[1] or []} if row else None
 
 
-def store_cached_answer(cache_key, question, topic, answer):
+def store_cached_answer(cache_key, question, topic, answer, sources=None):
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO qa_cache (cache_key, question, topic, answer) VALUES (%s, %s, %s, %s) "
+                "INSERT INTO qa_cache (cache_key, question, topic, answer, sources) "
+                "VALUES (%s, %s, %s, %s, %s) "
                 "ON CONFLICT (cache_key) DO UPDATE SET question = EXCLUDED.question, "
-                "topic = EXCLUDED.topic, answer = EXCLUDED.answer, created_at = now()",
-                (cache_key, question, topic, answer),
+                "topic = EXCLUDED.topic, answer = EXCLUDED.answer, sources = EXCLUDED.sources, created_at = now()",
+                (
+                    cache_key,
+                    question,
+                    topic,
+                    answer,
+                    psycopg2.extras.Json(sources or []),
+                ),
             )
             # ตัด cache เก่าสุดทิ้งถ้าเกิน 500 รายการ
             cur.execute("SELECT count(*) FROM qa_cache")
