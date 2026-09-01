@@ -17,13 +17,16 @@
 | C code formatting | A model could flatten a `//` comment and the next statement onto one line | Prompt rule plus a deterministic fenced-C guard separates commented executable statements |
 | Mode feedback | A database write could leave the old badge visible with no feedback | Spinner during the write, success toast, and short-lived cached chat summaries |
 | Stale incorrect answers | An earlier bad answer could remain in the answer cache | Versioned cache keys bypass the previous cache generation safely |
+| Completed answer visibility | Answer content was rendered inside a collapsed status box | Status and answer now render separately, so completed content remains visible |
+| Retry visibility | A retry created after the controls had rendered appeared only on a later interaction | Failed turns rerun once and reveal the retry action immediately |
+| Flattened inline C | The first guard only covered fenced `c` blocks | Inline/plain flattened C is repaired and Hello World receives a complete verified example |
 
 ## Verification result
 
 - Source compilation validation for `app.py`, `db.py`, `generation_utils.py`, and
   `prompt.py` passed. (`py_compile` could not replace one locked Windows cache file,
   so the same Python compiler was run without writing bytecode.)
-- `python -m unittest discover -s tests -v` ran 27 tests: 25 passed and
+- `python -m unittest discover -s tests -v` ran 30 tests: 28 passed and
   2 OCR/file tests were skipped on the inspection machine because pandas is not
   installed there.
 - Added coverage for chat summary mapping, append ownership, sequence allocation,

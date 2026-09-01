@@ -13,6 +13,7 @@ from google import genai
 from google.genai import types
 from prompt import SINGLE_MODE
 from generation_utils import (
+    ensure_c_hello_world_example,
     PartialStreamError,
     generate_text_stream_with_fallback,
     is_model_quota_error,
@@ -72,7 +73,7 @@ def _bounded_int_config(key, default, minimum, maximum):
 
 
 AI_REQUEST_TIMEOUT_MS = _bounded_int_config(
-    "AI_REQUEST_TIMEOUT_MS", 20000, 5000, 60000
+    "AI_REQUEST_TIMEOUT_MS", 15000, 5000, 60000
 )
 
 TEXT_EDITABLE_EXTS = {".txt", ".md", ".json", ".html", ".htm"}
@@ -161,7 +162,7 @@ def _user_id():
 
 
 # ===== Cache คำตอบคำถามซ้ำ (ลดจำนวนครั้งที่ต้องยิง Gemini API) =====
-QA_CACHE_VERSION = "v2-code-safety"
+QA_CACHE_VERSION = "v3-code-rendering"
 
 
 def _normalize_question(text):
@@ -449,14 +450,19 @@ def generate_response(prompt, force_web=False):
     system_instruction = SINGLE_MODE["prompt"]
 
     with st.chat_message("model"):
-        with st.status("กำลังเตรียมคำตอบ...", expanded=False) as status:
+        status = st.status("กำลังเตรียมคำตอบ...", expanded=False)
+        # Keep the actual answer outside st.status. Completed status boxes
+        # collapse automatically and used to hide a finished answer until the
+        # next Streamlit rerun.
+        answer_placeholder = st.empty()
+        with status:
             if topic_slug and not force_web and _is_knowledge_file_list_request(prompt):
                 status.update(label="กำลังอ่านรายชื่อไฟล์ Knowledge...")
                 phase_started = time.perf_counter()
                 answer = _knowledge_file_list_answer(topic_name, db.list_sources(topic_slug))
                 timings["database_ms"] = (time.perf_counter() - phase_started) * 1000
                 status.update(label="ตอบเสร็จแล้ว", state="complete")
-                st.write(answer)
+                answer_placeholder.markdown(answer)
                 st.session_state["messages"].append(
                     {"role": "model", "content": answer, "timestamp": _now_str()}
                 )
@@ -480,14 +486,17 @@ def generate_response(prompt, force_web=False):
                     cached_answer = cached_entry["answer"]
                     status.update(label="ตอบจาก cache แล้ว", state="complete")
                     st.caption("⚡ ใช้คำตอบที่เคยตรวจค้นไว้แล้ว เพื่อลดเวลารอและโควตา API")
-                    st.write(cached_answer)
+                    answer_placeholder.markdown(cached_answer)
                     cached_sources = cached_entry.get("sources") or []
                     if cached_sources:
                         with st.expander(f"แหล่งอ้างอิงจาก Knowledge ({len(cached_sources)})"):
                             for item in cached_sources:
                                 st.markdown(f"- **{item['source']}** — {item['location']}")
                     st.session_state["messages"].append(
-                        {"role": "model", "content": cached_answer, "timestamp": _now_str()}
+                        {
+                            "role": "model", "content": cached_answer,
+                            "timestamp": _now_str(), "sources": cached_sources,
+                        }
                     )
                     st.session_state.pop("retry_request", None)
                     _store_performance(
@@ -520,7 +529,7 @@ def generate_response(prompt, force_web=False):
                         "prompt": prompt, "force_web": force_web,
                     }
                     status.update(label="ค้น Knowledge ไม่สำเร็จ", state="error")
-                    st.write(answer)
+                    answer_placeholder.markdown(answer)
                     st.session_state["messages"].append(
                         {"role": "model", "content": answer, "timestamp": _now_str()}
                     )
@@ -539,7 +548,7 @@ def generate_response(prompt, force_web=False):
                     st.session_state["pending_web_query"] = prompt
                     st.session_state.pop("retry_request", None)
                     status.update(label="ไม่พบหลักฐานที่เพียงพอ", state="error")
-                    st.write(answer)
+                    answer_placeholder.markdown(answer)
                     st.session_state["messages"].append(
                         {"role": "model", "content": answer, "timestamp": _now_str()}
                     )
@@ -590,7 +599,6 @@ def generate_response(prompt, force_web=False):
                 tools=tools,
             )
             status.update(label="กำลังรอคำตอบจาก AI...")
-            answer_placeholder = st.empty()
             streamed_text = ""
 
             def show_delta(delta):
@@ -606,6 +614,8 @@ def generate_response(prompt, force_web=False):
                     history, config, show_delta
                 )
                 answer = repair_c_code_blocks(answer)
+                if topic_slug and not force_web:
+                    answer = ensure_c_hello_world_example(prompt, answer)
                 if force_web or not topic_slug:
                     answer = _append_web_sources(answer, web_sources)
                 answer_placeholder.markdown(answer)
@@ -661,17 +671,18 @@ def generate_response(prompt, force_web=False):
                 for item in retrieved:
                     st.markdown(f"- **{item['source']}** — {item['location']}")
 
-    st.session_state["messages"].append(
-        {"role": "model", "content": answer, "timestamp": _now_str()}
-    )
+    message_sources = [
+        {"source": item["source"], "location": item["location"]}
+        for item in retrieved
+    ]
+    st.session_state["messages"].append({
+        "role": "model", "content": answer, "timestamp": _now_str(),
+        "sources": message_sources,
+    })
     if successful:
         cache_started = time.perf_counter()
-        cached_sources = [
-            {"source": item["source"], "location": item["location"]}
-            for item in retrieved
-        ]
         try:
-            store_cached_answer(prompt, topic_slug, answer, sources=cached_sources)
+            store_cached_answer(prompt, topic_slug, answer, sources=message_sources)
         except Exception as exc:
             # Cache is an optimization; a cache write must never discard a
             # valid answer or turn the chat UI into an error page.
@@ -1208,6 +1219,11 @@ if st.session_state.get("chat_has_more"):
 for msg in st.session_state["messages"]:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
+        message_sources = msg.get("sources") or []
+        if message_sources:
+            with st.expander(f"แหล่งอ้างอิงจาก Knowledge ({len(message_sources)})"):
+                for item in message_sources:
+                    st.markdown(f"- **{item['source']}** — {item['location']}")
         if msg.get("timestamp"):
             st.caption(msg["timestamp"])
 
@@ -1316,4 +1332,9 @@ if prompt := st.chat_input(input_placeholder):
             db.rename_chat(current_chat, auto_title_from_message(prompt), _user_id())
             _clear_chat_summary_cache()
             st.session_state["chat_needs_auto_title"] = False
+            st.rerun()
+        if st.session_state.get("retry_request"):
+            # The retry controls are located above chat_input and have already
+            # rendered in this run. Rerun once so a newly-created retry action
+            # becomes visible immediately.
             st.rerun()

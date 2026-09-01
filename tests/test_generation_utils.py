@@ -4,6 +4,7 @@ from generation_utils import (
     DEFAULT_GENERATION_MODELS,
     PartialStreamError,
     generate_text_stream_with_fallback,
+    ensure_c_hello_world_example,
     is_model_quota_error,
     is_model_unavailable_error,
     is_transient_generation_error,
@@ -114,6 +115,29 @@ class GenerationUtilsTests(unittest.TestCase):
     def test_does_not_modify_non_c_code_fence(self):
         original = '```text\n// This prints "Hello" printf("Hello");\n```'
         self.assertEqual(repair_c_code_blocks(original), original)
+
+    def test_repairs_flattened_inline_c_code(self):
+        broken = 'คำตอบคือ `// This prints "Hello World" printf("Hello World"); return 0;`'
+        fixed = repair_c_code_blocks(broken)
+        self.assertIn("```c", fixed)
+        self.assertIn('// This prints "Hello World"\nprintf("Hello World");\nreturn 0;', fixed)
+
+    def test_hello_world_gets_complete_compilable_example(self):
+        fixed = ensure_c_hello_world_example(
+            "ขอตัวอย่าง Hello World", "ใช้ printf เพื่อแสดงข้อความ"
+        )
+        self.assertIn("#include <stdio.h>", fixed)
+        self.assertIn("int main(void)", fixed)
+        self.assertIn('printf("Hello World\\n");', fixed)
+
+    def test_complete_hello_world_is_not_duplicated(self):
+        complete = (
+            '```c\n#include <stdio.h>\nint main(void) {\n'
+            'printf("Hello World");\nreturn 0;\n}\n```'
+        )
+        self.assertEqual(
+            ensure_c_hello_world_example("Hello World", complete), complete
+        )
 
 
 if __name__ == "__main__":

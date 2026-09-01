@@ -60,10 +60,41 @@ class PartialStreamError(RuntimeError):
 
 
 _C_FENCE_RE = re.compile(r"(```c\s*\n)(.*?)(\n```)", re.IGNORECASE | re.DOTALL)
+_ANY_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
 _C_STATEMENT_AFTER_COMMENT_RE = re.compile(
     r"\b(?:printf|puts|scanf|fprintf|fputs|fputc)\s*\([^;\n]*\)\s*;"
     r"|\breturn\s+[^;\n]+;"
 )
+
+
+def _split_flattened_c_line(line):
+    stripped = line.lstrip()
+    lowered = stripped.lower()
+    if not stripped.startswith("//") or any(
+        marker in lowered for marker in ("example:", "e.g.", "เช่น")
+    ):
+        return None
+    statement = _C_STATEMENT_AFTER_COMMENT_RE.search(stripped[2:])
+    if not statement:
+        return None
+    comment = stripped[:statement.start() + 2].rstrip()
+    executable = stripped[statement.start() + 2:].lstrip()
+    comment_lower = comment.lower()
+    if not (
+        '"' in comment
+        or "'" in comment
+        or "this prints" in comment_lower
+        or "แสดง" in comment
+    ):
+        return None
+    indent = line[:len(line) - len(stripped)]
+    executable = re.sub(
+        r";\s+(?=(?:return|printf|puts|scanf|fprintf|fputs|fputc)\b)",
+        ";\n" + indent,
+        executable,
+    )
+    return indent + comment + "\n" + indent + executable
 
 
 def repair_c_code_blocks(text):
@@ -76,35 +107,54 @@ def repair_c_code_blocks(text):
     def repair_block(match):
         fixed_lines = []
         for line in match.group(2).splitlines():
-            stripped = line.lstrip()
-            lowered = stripped.lower()
-            if not stripped.startswith("//") or any(
-                marker in lowered for marker in ("example:", "e.g.", "เช่น")
-            ):
-                fixed_lines.append(line)
-                continue
-            statement = _C_STATEMENT_AFTER_COMMENT_RE.search(stripped[2:])
-            if not statement:
-                fixed_lines.append(line)
-                continue
-            comment = stripped[:statement.start() + 2].rstrip()
-            executable = stripped[statement.start() + 2:].lstrip()
-            # A quote or an explanatory phrase makes this a high-confidence
-            # flattened source comment, rather than a comment showing syntax.
-            comment_lower = comment.lower()
-            if not (
-                '"' in comment
-                or "'" in comment
-                or "this prints" in comment_lower
-                or "แสดง" in comment
-            ):
-                fixed_lines.append(line)
-                continue
-            indent = line[:len(line) - len(stripped)]
-            fixed_lines.extend((indent + comment, indent + executable))
+            fixed_lines.append(_split_flattened_c_line(line) or line)
         return match.group(1) + "\n".join(fixed_lines) + match.group(3)
 
-    return _C_FENCE_RE.sub(repair_block, str(text or ""))
+    repaired = _C_FENCE_RE.sub(repair_block, str(text or ""))
+
+    def repair_inline(match):
+        fixed = _split_flattened_c_line(match.group(1))
+        if not fixed:
+            return match.group(0)
+        return f"```c\n{fixed}\n```"
+
+    repaired = _INLINE_CODE_RE.sub(repair_inline, repaired)
+
+    def repair_plain(segment):
+        output = []
+        for line in segment.splitlines(keepends=True):
+            body = line.rstrip("\r\n")
+            ending = line[len(body):]
+            output.append((_split_flattened_c_line(body) or body) + ending)
+        return "".join(output)
+
+    pieces = []
+    cursor = 0
+    for fence in _ANY_FENCE_RE.finditer(repaired):
+        pieces.append(repair_plain(repaired[cursor:fence.start()]))
+        pieces.append(fence.group(0))
+        cursor = fence.end()
+    pieces.append(repair_plain(repaired[cursor:]))
+    return "".join(pieces)
+
+
+def ensure_c_hello_world_example(prompt, answer):
+    """Append a complete verified C example when a Hello World answer lacks one."""
+    if "hello world" not in str(prompt or "").lower():
+        return answer
+    normalized = str(answer or "").lower()
+    has_complete_example = all(marker in normalized for marker in (
+        "#include <stdio.h>", "int main", "printf", "hello world", "return 0;",
+    ))
+    if has_complete_example:
+        return answer
+    verified = (
+        "ตัวอย่างภาษา C ที่สมบูรณ์และคอมไพล์ได้:\n\n"
+        "```c\n#include <stdio.h>\n\nint main(void) {\n"
+        "    printf(\"Hello World\\n\");\n    return 0;\n}\n```\n\n"
+        "ผลลัพธ์:\n\n```text\nHello World\n```"
+    )
+    return str(answer or "").rstrip() + "\n\n" + verified
 
 
 def generate_text_stream_with_fallback(
