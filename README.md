@@ -1,4 +1,4 @@
-# Major.AI
+# Cbot
 
 Streamlit chatbot with Gemini generation/search, local multilingual ONNX
 embeddings, and Neon Postgres/pgvector storage.

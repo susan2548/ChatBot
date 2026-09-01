@@ -26,7 +26,7 @@ import db
 RUN_STARTED_AT = time.perf_counter()
 
 st.set_page_config(
-    page_title="Major.AI",
+    page_title="Cbot",
     page_icon="💀",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -139,7 +139,7 @@ SAFETY_SETTINGS = [
 
 
 if "user" not in st.session_state:
-    st.title("Major.AI")
+    st.title("Cbot")
     st.caption("เข้าสู่ระบบเพื่อใช้แชตและ knowledge ส่วนตัว")
     with st.form("user_login_form"):
         login_username = st.text_input("ชื่อผู้ใช้")
@@ -229,7 +229,7 @@ def _generate_content_with_fallback(contents, config, max_attempts_per_model=1):
                     model=model_name, contents=contents, config=config
                 )
                 if model_index:
-                    print(f"[Major.AI] fallback model succeeded: {model_name}")
+                    print(f"[Cbot] fallback model succeeded: {model_name}")
                 return response, model_name
             except Exception as exc:
                 last_error = exc
@@ -240,7 +240,7 @@ def _generate_content_with_fallback(contents, config, max_attempts_per_model=1):
                         else "none"
                     )
                     print(
-                        f"[Major.AI] model unavailable: {model_name}; next={next_model}: "
+                        f"[Cbot] model unavailable: {model_name}; next={next_model}: "
                         f"{type(exc).__name__}: {exc}"
                     )
                     break
@@ -248,7 +248,7 @@ def _generate_content_with_fallback(contents, config, max_attempts_per_model=1):
                     raise
                 wait_seconds = 1.5 * (2 ** attempt)
                 print(
-                    f"[Major.AI] transient error on {model_name}; retry "
+                    f"[Cbot] transient error on {model_name}; retry "
                     f"{attempt + 2}/{max_attempts_per_model} in {wait_seconds:.1f}s: "
                     f"{type(exc).__name__}: {exc}"
                 )
@@ -272,7 +272,7 @@ def _generate_content_stream_with_fallback(contents, config, on_delta):
         max_attempts_per_model=1,
     )
     if model_used != GENERATION_MODELS[0]:
-        print(f"[Major.AI] fallback streaming model succeeded: {model_used}")
+        print(f"[Cbot] fallback streaming model succeeded: {model_used}")
     return answer, model_used, sources
 
 
@@ -341,7 +341,7 @@ def change_current_chat_mode_with_feedback(topic_slug=None, topic_name=None):
             set_current_chat_mode(topic_slug, topic_name)
     except Exception as exc:
         request_id = secrets.token_hex(4).upper()
-        print(f"[Major.AI][{request_id}] mode change failed: {type(exc).__name__}: {exc}")
+        print(f"[Cbot][{request_id}] mode change failed: {type(exc).__name__}: {exc}")
         st.error(f"เปลี่ยนโหมดไม่สำเร็จ กรุณาลองใหม่ (รหัสเหตุการณ์: {request_id})")
         return False
     st.session_state["mode_change_notice"] = f"เปลี่ยนเป็น {target} แล้ว"
@@ -358,7 +358,7 @@ def _new_chat_filename():
 
 def _welcome_messages():
     return [
-        {"role": "model", "content": "สวัสดีครับ มีอะไรให้ Major.AI ช่วยไหม", "timestamp": _now_str()}
+        {"role": "model", "content": "สวัสดีครับ มีอะไรให้ Cbot ช่วยไหม", "timestamp": _now_str()}
     ]
 
 
@@ -433,7 +433,7 @@ def _store_performance(started_at, timings, **details):
     details.setdefault("request_id", st.session_state.get("active_request_id"))
     safe_details.update(details)
     st.session_state["last_performance"] = safe_details
-    print(f"[Major.AI] performance: {safe_details}")
+    print(f"[Cbot] performance: {safe_details}")
 
 
 def generate_response(prompt, force_web=False):
@@ -474,7 +474,7 @@ def generate_response(prompt, force_web=False):
                     cached_entry = get_cached_answer(prompt, topic_slug)
                 except Exception as exc:
                     cached_entry = None
-                    print(f"[Major.AI] cache read skipped: {type(exc).__name__}: {exc}")
+                    print(f"[Cbot] cache read skipped: {type(exc).__name__}: {exc}")
                 timings["cache_ms"] = (time.perf_counter() - phase_started) * 1000
                 if cached_entry is not None:
                     cached_answer = cached_entry["answer"]
@@ -511,7 +511,7 @@ def generate_response(prompt, force_web=False):
                     )
                 except Exception as exc:
                     timings["retrieval_total_ms"] = (time.perf_counter() - phase_started) * 1000
-                    print(f"[Major.AI][{request_id}] retrieval failed: {type(exc).__name__}: {exc}")
+                    print(f"[Cbot][{request_id}] retrieval failed: {type(exc).__name__}: {exc}")
                     answer = (
                         "ระบบค้น Knowledge ขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง "
                         f"(รหัสเหตุการณ์: {request_id})"
@@ -611,7 +611,7 @@ def generate_response(prompt, force_web=False):
                 answer_placeholder.markdown(answer)
                 successful = True
                 st.session_state.pop("retry_request", None)
-                print(f"[Major.AI] generation model used: {model_used}")
+                print(f"[Cbot] generation model used: {model_used}")
                 status.update(label="ตอบเสร็จแล้ว", state="complete")
             except _RateQueueFullError as exc:
                 answer = (
@@ -624,7 +624,7 @@ def generate_response(prompt, force_web=False):
                 answer_placeholder.markdown(answer)
                 status.update(label="คิวเต็ม", state="error")
             except PartialStreamError as exc:
-                print(f"[Major.AI][{request_id}] partial stream discarded: {type(exc).__name__}: {exc}")
+                print(f"[Cbot][{request_id}] partial stream discarded: {type(exc).__name__}: {exc}")
                 answer = (
                     "การเชื่อมต่อ AI ขาดระหว่างตอบ ระบบไม่ได้บันทึกคำตอบที่ไม่สมบูรณ์ "
                     f"กรุณาลองใหม่ (รหัสเหตุการณ์: {request_id})"
@@ -636,7 +636,7 @@ def generate_response(prompt, force_web=False):
                 status.update(label="การเชื่อมต่อขาดระหว่างตอบ", state="error")
             except Exception as exc:
                 error_text = f"{type(exc).__name__}: {exc}".lower()
-                print(f"[Major.AI][{request_id}] generate_content error: {type(exc).__name__}: {exc}")
+                print(f"[Cbot][{request_id}] generate_content error: {type(exc).__name__}: {exc}")
                 if "timeout" in error_text or "deadline" in error_text:
                     answer = (
                         f"AI ตอบไม่ทันภายใน {AI_REQUEST_TIMEOUT_MS // 1000} วินาที "
@@ -675,7 +675,7 @@ def generate_response(prompt, force_web=False):
         except Exception as exc:
             # Cache is an optimization; a cache write must never discard a
             # valid answer or turn the chat UI into an error page.
-            print(f"[Major.AI] cache write skipped: {type(exc).__name__}: {exc}")
+            print(f"[Cbot] cache write skipped: {type(exc).__name__}: {exc}")
         timings["cache_write_ms"] = (time.perf_counter() - cache_started) * 1000
     _store_performance(
         response_started, timings,
@@ -809,7 +809,7 @@ def _process_uploaded_files(selected_slug, uploaded_files):
                 processed_uploads.add(upload_key)
             except Exception as exc:
                 st.error(f"เพิ่มไฟล์ '{uploaded.name}' ไม่สำเร็จ: {exc}")
-                print(f"[Major.AI] add_document failed for {uploaded.name}: {exc}")
+                print(f"[Cbot] add_document failed for {uploaded.name}: {exc}")
                 break
             finally:
                 if tmp_path and os.path.exists(tmp_path):
@@ -821,7 +821,7 @@ def _process_uploaded_files(selected_slug, uploaded_files):
 
 # ===== UI: sidebar =====
 with st.sidebar:
-    st.markdown("### 💀 Major.AI")
+    st.markdown("### 💀 Cbot")
     render_admin_login()
 
     if is_admin() and st.toggle(
@@ -1160,7 +1160,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("💀 Major.AI")
+st.title("💀 Cbot")
 st.caption("ถามทั่วไป หรือเลือก Knowledge เพื่อให้ตอบจากเอกสารเฉพาะเรื่อง")
 if st.session_state["active_topic_slug"]:
     safe_topic_name = html.escape(st.session_state["active_topic_name"] or "")
@@ -1181,7 +1181,7 @@ if mode_change_notice:
 # ===== คำแนะนำการใช้งาน =====
 with st.expander("❓ วิธีใช้งาน", expanded=not st.session_state["intro_dismissed"]):
     st.markdown(
-        "- พิมพ์คำถามคุยกับ Major.AI ได้เลย ตอบได้ทุกเรื่อง ค้นอินเทอร์เน็ตได้ด้วย\n"
+        "- พิมพ์คำถามคุยกับ Cbot ได้เลย ตอบได้ทุกเรื่อง ค้นอินเทอร์เน็ตได้ด้วย\n"
         "- อยากให้ตอบโดยอ้างอิงความรู้เฉพาะเรื่อง (knowledge) พิมพ์ **/** แล้วกด Enter "
         "จะมีเมนูให้เลือกหัวข้อ\n"
         "- เลือกหัวข้อแล้วจะใช้ต่อเนื่องทุกคำถาม จนกว่าจะกด \"✖ เลิกใช้\" หรือพิมพ์ / เพื่อเปลี่ยนหัวข้อ\n"

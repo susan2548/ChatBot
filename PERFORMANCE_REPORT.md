@@ -1,4 +1,4 @@
-# Major.AI performance improvement report
+# Cbot performance improvement report
 
 ## Before and after
 

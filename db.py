@@ -591,7 +591,7 @@ def _source_exists(topic_slug, filename):
 def _add_zip(topic_slug, zip_path):
     """แตกไฟล์ในซิปลง temp dir ชั่วคราว แล้วเพิ่มทุกไฟล์ที่รองรับข้างใน (กันเพิ่มซ้ำเหมือนไฟล์ทั่วไป)"""
     total = 0
-    tmp_dir = tempfile.mkdtemp(prefix="major_ai_zip_")
+    tmp_dir = tempfile.mkdtemp(prefix="cbot_zip_")
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             for member in zf.namelist():
