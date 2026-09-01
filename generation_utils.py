@@ -1,3 +1,4 @@
+import re
 import time
 
 
@@ -56,6 +57,54 @@ def is_transient_generation_error(exc):
 
 class PartialStreamError(RuntimeError):
     """Raised when a provider fails after already emitting answer text."""
+
+
+_C_FENCE_RE = re.compile(r"(```c\s*\n)(.*?)(\n```)", re.IGNORECASE | re.DOTALL)
+_C_STATEMENT_AFTER_COMMENT_RE = re.compile(
+    r"\b(?:printf|puts|scanf|fprintf|fputs|fputc)\s*\([^;\n]*\)\s*;"
+    r"|\breturn\s+[^;\n]+;"
+)
+
+
+def repair_c_code_blocks(text):
+    """Repair a common LLM formatting error inside fenced C examples.
+
+    Models occasionally flatten a source comment and the following executable
+    statement onto one ``//`` line.  C then comments out that statement.  This
+    guard only touches fenced C blocks and leaves explicit prose examples alone.
+    """
+    def repair_block(match):
+        fixed_lines = []
+        for line in match.group(2).splitlines():
+            stripped = line.lstrip()
+            lowered = stripped.lower()
+            if not stripped.startswith("//") or any(
+                marker in lowered for marker in ("example:", "e.g.", "เช่น")
+            ):
+                fixed_lines.append(line)
+                continue
+            statement = _C_STATEMENT_AFTER_COMMENT_RE.search(stripped[2:])
+            if not statement:
+                fixed_lines.append(line)
+                continue
+            comment = stripped[:statement.start() + 2].rstrip()
+            executable = stripped[statement.start() + 2:].lstrip()
+            # A quote or an explanatory phrase makes this a high-confidence
+            # flattened source comment, rather than a comment showing syntax.
+            comment_lower = comment.lower()
+            if not (
+                '"' in comment
+                or "'" in comment
+                or "this prints" in comment_lower
+                or "แสดง" in comment
+            ):
+                fixed_lines.append(line)
+                continue
+            indent = line[:len(line) - len(stripped)]
+            fixed_lines.extend((indent + comment, indent + executable))
+        return match.group(1) + "\n".join(fixed_lines) + match.group(3)
+
+    return _C_FENCE_RE.sub(repair_block, str(text or ""))
 
 
 def generate_text_stream_with_fallback(

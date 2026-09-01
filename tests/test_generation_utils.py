@@ -8,6 +8,7 @@ from generation_utils import (
     is_model_unavailable_error,
     is_transient_generation_error,
     parse_generation_models,
+    repair_c_code_blocks,
 )
 
 
@@ -96,6 +97,23 @@ class GenerationUtilsTests(unittest.TestCase):
                 sleep_fn=lambda seconds: None,
             )
         self.assertEqual(attempted, ["model-a"])
+
+    def test_repairs_executable_statement_flattened_after_c_comment(self):
+        broken = '```c\n// This prints "Hello World" printf("Hello World");\nreturn 0;\n```'
+        fixed = repair_c_code_blocks(broken)
+        self.assertIn('// This prints "Hello World"\nprintf("Hello World");', fixed)
+
+    def test_keeps_comment_that_explicitly_demonstrates_syntax(self):
+        original = '```c\n// Example: printf("Hello");\n```'
+        self.assertEqual(repair_c_code_blocks(original), original)
+
+    def test_keeps_valid_postfix_statement_unchanged(self):
+        original = '```c\nprintf("%d", x++);\n```'
+        self.assertEqual(repair_c_code_blocks(original), original)
+
+    def test_does_not_modify_non_c_code_fence(self):
+        original = '```text\n// This prints "Hello" printf("Hello");\n```'
+        self.assertEqual(repair_c_code_blocks(original), original)
 
 
 if __name__ == "__main__":

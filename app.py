@@ -19,6 +19,7 @@ from generation_utils import (
     is_model_unavailable_error,
     is_transient_generation_error,
     parse_generation_models,
+    repair_c_code_blocks,
 )
 import db
 
@@ -61,6 +62,19 @@ if not database_url:
 # ===== สิทธิ์ Admin =====
 ADMIN_PASSWORD = get_config("ADMIN_PASSWORD")
 
+
+def _bounded_int_config(key, default, minimum, maximum):
+    try:
+        value = int(get_config(key) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+AI_REQUEST_TIMEOUT_MS = _bounded_int_config(
+    "AI_REQUEST_TIMEOUT_MS", 20000, 5000, 60000
+)
+
 TEXT_EDITABLE_EXTS = {".txt", ".md", ".json", ".html", ".htm"}
 
 
@@ -70,11 +84,17 @@ def is_admin() -> bool:
 
 
 @st.cache_resource(show_spinner=False)
-def _initialize_services(database_url_value, api_key_value, admin_password):
+def _initialize_services(database_url_value, api_key_value, admin_password, timeout_ms):
     """Initialize shared clients/schema once per Streamlit server process."""
     db.init_db(database_url_value, api_key_value)
     db.ensure_admin_user(admin_password)
-    return genai.Client(api_key=api_key_value)
+    return genai.Client(
+        api_key=api_key_value,
+        http_options=types.HttpOptions(
+            timeout=timeout_ms,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
 
 
 @st.cache_resource(show_spinner=False)
@@ -96,7 +116,18 @@ def _clear_topic_cache():
     _cached_topics.clear()
 
 
-client = _initialize_services(database_url, api_key, ADMIN_PASSWORD)
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_chat_summaries(owner_id):
+    return db.list_chat_summaries(owner_id)
+
+
+def _clear_chat_summary_cache():
+    _cached_chat_summaries.clear()
+
+
+client = _initialize_services(
+    database_url, api_key, ADMIN_PASSWORD, AI_REQUEST_TIMEOUT_MS
+)
 GENERATION_MODELS = parse_generation_models(get_config("GEMINI_MODELS"))
 
 SAFETY_SETTINGS = [
@@ -130,12 +161,15 @@ def _user_id():
 
 
 # ===== Cache คำตอบคำถามซ้ำ (ลดจำนวนครั้งที่ต้องยิง Gemini API) =====
+QA_CACHE_VERSION = "v2-code-safety"
+
+
 def _normalize_question(text):
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
 def _qa_cache_key(prompt, topic_slug):
-    raw = f"{topic_slug or ''}|{_normalize_question(prompt)}"
+    raw = f"{QA_CACHE_VERSION}|{topic_slug or ''}|{_normalize_question(prompt)}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
@@ -184,7 +218,7 @@ def _wait_for_rate_slot():
         time.sleep(0.25)
 
 
-def _generate_content_with_fallback(contents, config, max_attempts_per_model=2):
+def _generate_content_with_fallback(contents, config, max_attempts_per_model=1):
     """Try each model in order; quota exhaustion switches models without same-model retries."""
     last_error = None
     for model_index, model_name in enumerate(GENERATION_MODELS):
@@ -235,6 +269,7 @@ def _generate_content_stream_with_fallback(contents, config, on_delta):
         reserve_slot=_wait_for_rate_slot,
         on_delta=on_delta,
         extract_sources=_web_sources_from_response,
+        max_attempts_per_model=1,
     )
     if model_used != GENERATION_MODELS[0]:
         print(f"[Major.AI] fallback streaming model succeeded: {model_used}")
@@ -252,6 +287,7 @@ def auto_title_from_message(text, max_len=40):
 
 def save_chat():
     db.save_chat(st.session_state["current_chat"], st.session_state["messages"], _user_id())
+    _clear_chat_summary_cache()
 
 
 def append_new_messages(start_index):
@@ -286,11 +322,30 @@ def restore_chat_mode(filename, summary=None):
 
 
 def set_current_chat_mode(topic_slug=None, topic_name=None):
-    st.session_state["active_topic_slug"] = topic_slug
-    st.session_state["active_topic_name"] = topic_name
     db.set_chat_mode(
         st.session_state["current_chat"], topic_slug, topic_name, _user_id()
     )
+    st.session_state["active_topic_slug"] = topic_slug
+    st.session_state["active_topic_name"] = topic_name
+    overrides = st.session_state.setdefault("chat_mode_overrides", {})
+    overrides[st.session_state["current_chat"]] = {
+        "topic_slug": topic_slug,
+        "topic_name": topic_name,
+    }
+
+
+def change_current_chat_mode_with_feedback(topic_slug=None, topic_name=None):
+    target = f"Knowledge ‘{topic_name}’" if topic_slug else "โหมดแชททั่วไป"
+    try:
+        with st.spinner(f"กำลังเปลี่ยนเป็น {target}..."):
+            set_current_chat_mode(topic_slug, topic_name)
+    except Exception as exc:
+        request_id = secrets.token_hex(4).upper()
+        print(f"[Major.AI][{request_id}] mode change failed: {type(exc).__name__}: {exc}")
+        st.error(f"เปลี่ยนโหมดไม่สำเร็จ กรุณาลองใหม่ (รหัสเหตุการณ์: {request_id})")
+        return False
+    st.session_state["mode_change_notice"] = f"เปลี่ยนเป็น {target} แล้ว"
+    return True
 
 
 def _now_str():
@@ -375,6 +430,7 @@ def _store_performance(started_at, timings, **details):
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
         "timings": {key: round(value, 1) for key, value in timings.items()},
     }
+    details.setdefault("request_id", st.session_state.get("active_request_id"))
     safe_details.update(details)
     st.session_state["last_performance"] = safe_details
     print(f"[Major.AI] performance: {safe_details}")
@@ -382,6 +438,8 @@ def _store_performance(started_at, timings, **details):
 
 def generate_response(prompt, force_web=False):
     """RAG-first response with citations and explicit web fallback."""
+    request_id = secrets.token_hex(4).upper()
+    st.session_state["active_request_id"] = request_id
     response_started = time.perf_counter()
     timings = {}
     topic_slug = st.session_state.get("active_topic_slug")
@@ -402,6 +460,7 @@ def generate_response(prompt, force_web=False):
                 st.session_state["messages"].append(
                     {"role": "model", "content": answer, "timestamp": _now_str()}
                 )
+                st.session_state.pop("retry_request", None)
                 _store_performance(
                     response_started, timings, mode="knowledge_file_list",
                     cache_hit=False, status="success", retrieved_count=0,
@@ -430,6 +489,7 @@ def generate_response(prompt, force_web=False):
                     st.session_state["messages"].append(
                         {"role": "model", "content": cached_answer, "timestamp": _now_str()}
                     )
+                    st.session_state.pop("retry_request", None)
                     _store_performance(
                         response_started, timings,
                         mode="knowledge" if topic_slug else "general",
@@ -451,8 +511,14 @@ def generate_response(prompt, force_web=False):
                     )
                 except Exception as exc:
                     timings["retrieval_total_ms"] = (time.perf_counter() - phase_started) * 1000
-                    print(f"[Major.AI] retrieval failed: {type(exc).__name__}: {exc}")
-                    answer = "ระบบค้น Knowledge ขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง"
+                    print(f"[Major.AI][{request_id}] retrieval failed: {type(exc).__name__}: {exc}")
+                    answer = (
+                        "ระบบค้น Knowledge ขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง "
+                        f"(รหัสเหตุการณ์: {request_id})"
+                    )
+                    st.session_state["retry_request"] = {
+                        "prompt": prompt, "force_web": force_web,
+                    }
                     status.update(label="ค้น Knowledge ไม่สำเร็จ", state="error")
                     st.write(answer)
                     st.session_state["messages"].append(
@@ -471,6 +537,7 @@ def generate_response(prompt, force_web=False):
                         "จึงยังไม่ขอตอบจากการคาดเดา กดปุ่มค้นอินเทอร์เน็ตด้านล่างได้"
                     )
                     st.session_state["pending_web_query"] = prompt
+                    st.session_state.pop("retry_request", None)
                     status.update(label="ไม่พบหลักฐานที่เพียงพอ", state="error")
                     st.write(answer)
                     st.session_state["messages"].append(
@@ -538,26 +605,55 @@ def generate_response(prompt, force_web=False):
                 answer, model_used, web_sources = _generate_content_stream_with_fallback(
                     history, config, show_delta
                 )
+                answer = repair_c_code_blocks(answer)
                 if force_web or not topic_slug:
                     answer = _append_web_sources(answer, web_sources)
                 answer_placeholder.markdown(answer)
                 successful = True
+                st.session_state.pop("retry_request", None)
                 print(f"[Major.AI] generation model used: {model_used}")
                 status.update(label="ตอบเสร็จแล้ว", state="complete")
             except _RateQueueFullError as exc:
-                answer = f"คิว AI เต็มชั่วคราว กรุณาลองใหม่ในประมาณ {exc.retry_after} วินาที"
+                answer = (
+                    f"คิว AI เต็มชั่วคราว กรุณาลองใหม่ในประมาณ {exc.retry_after} วินาที "
+                    f"(รหัสเหตุการณ์: {request_id})"
+                )
+                st.session_state["retry_request"] = {
+                    "prompt": prompt, "force_web": force_web,
+                }
                 answer_placeholder.markdown(answer)
                 status.update(label="คิวเต็ม", state="error")
             except PartialStreamError as exc:
-                print(f"[Major.AI] partial stream discarded: {type(exc).__name__}: {exc}")
-                answer = "การเชื่อมต่อ AI ขาดระหว่างตอบ ระบบไม่ได้บันทึกคำตอบที่ไม่สมบูรณ์ กรุณาลองใหม่"
+                print(f"[Major.AI][{request_id}] partial stream discarded: {type(exc).__name__}: {exc}")
+                answer = (
+                    "การเชื่อมต่อ AI ขาดระหว่างตอบ ระบบไม่ได้บันทึกคำตอบที่ไม่สมบูรณ์ "
+                    f"กรุณาลองใหม่ (รหัสเหตุการณ์: {request_id})"
+                )
+                st.session_state["retry_request"] = {
+                    "prompt": prompt, "force_web": force_web,
+                }
                 answer_placeholder.markdown(answer)
                 status.update(label="การเชื่อมต่อขาดระหว่างตอบ", state="error")
             except Exception as exc:
-                print(f"[Major.AI] generate_content error after retries: {type(exc).__name__}: {exc}")
-                answer = "ผู้ให้บริการ AI ขัดข้องชั่วคราว ระบบลองใหม่แล้วแต่ยังไม่สำเร็จ กรุณารอสักครู่"
+                error_text = f"{type(exc).__name__}: {exc}".lower()
+                print(f"[Major.AI][{request_id}] generate_content error: {type(exc).__name__}: {exc}")
+                if "timeout" in error_text or "deadline" in error_text:
+                    answer = (
+                        f"AI ตอบไม่ทันภายใน {AI_REQUEST_TIMEOUT_MS // 1000} วินาที "
+                        f"กรุณากดลองใหม่ (รหัสเหตุการณ์: {request_id})"
+                    )
+                    error_label = "AI ตอบเกินเวลาที่กำหนด"
+                else:
+                    answer = (
+                        "ผู้ให้บริการ AI ขัดข้องชั่วคราว กรุณาลองใหม่ "
+                        f"(รหัสเหตุการณ์: {request_id})"
+                    )
+                    error_label = "เกิดข้อผิดพลาด"
+                st.session_state["retry_request"] = {
+                    "prompt": prompt, "force_web": force_web,
+                }
                 answer_placeholder.markdown(answer)
-                status.update(label="เกิดข้อผิดพลาด", state="error")
+                status.update(label=error_label, state="error")
             timings["generation_ms"] = (time.perf_counter() - generation_started) * 1000
 
         if retrieved:
@@ -593,7 +689,12 @@ def generate_response(prompt, force_web=False):
 
 # ===== เตรียมสถานะเริ่มต้น =====
 sidebar_started = time.perf_counter()
-chat_summaries = db.list_chat_summaries(_user_id())
+chat_summaries = [dict(item) for item in _cached_chat_summaries(_user_id())]
+mode_overrides = st.session_state.get("chat_mode_overrides", {})
+for item in chat_summaries:
+    override = mode_overrides.get(item["filename"])
+    if override:
+        item.update(override)
 st.session_state["last_page_data_ms"] = round(
     (time.perf_counter() - sidebar_started) * 1000, 1
 )
@@ -775,8 +876,8 @@ with st.sidebar:
                 st.rerun()
         with mode_clear_col:
             if st.button("ทั่วไป", key="sidebar_clear_topic", use_container_width=True):
-                set_current_chat_mode()
-                st.rerun()
+                if change_current_chat_mode_with_feedback():
+                    st.rerun()
     else:
         st.markdown("**💬 แชททั่วไป**")
         if st.button("เลือก Knowledge", key="sidebar_pick_topic", use_container_width=True):
@@ -994,13 +1095,17 @@ with st.sidebar:
                 )
                 if st.button("💾 บันทึกชื่อ", key=f"rename_btn_{chat_file}"):
                     db.rename_chat(chat_file, new_name, _user_id())
+                    _clear_chat_summary_cache()
                     st.rerun()
                 st.divider()
                 if st.button("🔖 เลิกปักหมุด" if is_pinned else "📌 ปักหมุด", key=f"pin_{chat_file}"):
                     db.toggle_pin(chat_file, _user_id())
+                    _clear_chat_summary_cache()
                     st.rerun()
                 if st.button("🗑️ ลบแชทนี้", key=f"del_{chat_file}"):
                     db.delete_chat(chat_file, _user_id())
+                    _clear_chat_summary_cache()
+                    st.session_state.get("chat_mode_overrides", {}).pop(chat_file, None)
                     if chat_file == st.session_state["current_chat"]:
                         remaining = [
                             item for item in chat_summaries
@@ -1037,6 +1142,7 @@ with st.sidebar:
                     f"โหมด: {performance.get('mode', '-')} · "
                     f"รวม: {performance.get('total_ms', '-')} ms"
                 )
+                st.caption(f"รหัสเหตุการณ์: {performance.get('request_id', '-')}")
                 for phase, elapsed in performance.get("timings", {}).items():
                     st.text(f"{phase}: {elapsed} ms")
 
@@ -1067,6 +1173,10 @@ else:
         '<span class="mode-pill mode-pill-general">💬 โหมดแชททั่วไป</span>',
         unsafe_allow_html=True,
     )
+
+mode_change_notice = st.session_state.pop("mode_change_notice", None)
+if mode_change_notice:
+    st.toast(mode_change_notice)
 
 # ===== คำแนะนำการใช้งาน =====
 with st.expander("❓ วิธีใช้งาน", expanded=not st.session_state["intro_dismissed"]):
@@ -1123,9 +1233,11 @@ if st.session_state["awaiting_topic_pick"]:
             pick_col, cancel_col = st.columns(2)
             with pick_col:
                 if st.button("ใช้หัวข้อนี้", type="primary", use_container_width=True):
-                    set_current_chat_mode(picked_slug, topic_by_slug[picked_slug])
-                    st.session_state["awaiting_topic_pick"] = False
-                    st.rerun()
+                    if change_current_chat_mode_with_feedback(
+                        picked_slug, topic_by_slug[picked_slug]
+                    ):
+                        st.session_state["awaiting_topic_pick"] = False
+                        st.rerun()
             with cancel_col:
                 if st.button("ยกเลิก", use_container_width=True):
                     st.session_state["awaiting_topic_pick"] = False
@@ -1144,6 +1256,25 @@ if pending_web_query:
     with col_cancel:
         if st.button("ไม่ค้นอินเทอร์เน็ต"):
             st.session_state.pop("pending_web_query", None)
+            st.rerun()
+
+retry_request = st.session_state.get("retry_request")
+if retry_request:
+    st.caption("คำถามล่าสุดยังตอบไม่สำเร็จ คุณลองใหม่ได้โดยไม่ต้องพิมพ์คำถามซ้ำ")
+    retry_col, dismiss_retry_col = st.columns(2)
+    with retry_col:
+        if st.button("ลองคำถามล่าสุดอีกครั้ง", type="primary"):
+            retry_payload = dict(retry_request)
+            first_new_message = len(st.session_state["messages"])
+            generate_response(
+                retry_payload["prompt"],
+                force_web=retry_payload.get("force_web", False),
+            )
+            append_new_messages(first_new_message)
+            st.rerun()
+    with dismiss_retry_col:
+        if st.button("ปิดคำแนะนำนี้"):
+            st.session_state.pop("retry_request", None)
             st.rerun()
 
 if st.session_state["active_topic_slug"]:
@@ -1183,5 +1314,6 @@ if prompt := st.chat_input(input_placeholder):
             current_summary and current_summary.get("title")
         ):
             db.rename_chat(current_chat, auto_title_from_message(prompt), _user_id())
+            _clear_chat_summary_cache()
             st.session_state["chat_needs_auto_title"] = False
             st.rerun()
