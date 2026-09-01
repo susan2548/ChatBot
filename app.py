@@ -232,12 +232,16 @@ def _new_chat_filename():
     return datetime.now().strftime("chat_%Y%m%d_%H%M%S_") + secrets.token_hex(4) + ".json"
 
 
+def _welcome_messages():
+    return [
+        {"role": "model", "content": "สวัสดีครับ มีอะไรให้ Major.AI ช่วยไหม", "timestamp": _now_str()}
+    ]
+
+
 def new_chat():
     filename = _new_chat_filename()
     st.session_state["current_chat"] = filename
-    st.session_state["messages"] = [
-        {"role": "model", "content": "Major.AI มึงจะถามอะไร", "timestamp": _now_str()}
-    ]
+    st.session_state["messages"] = _welcome_messages()
     save_chat()
     set_current_chat_mode()
     st.rerun()
@@ -498,16 +502,25 @@ def generate_response(prompt, force_web=False):
 
 
 # ===== เตรียมสถานะเริ่มต้น =====
-if "current_chat" not in st.session_state:
-    chats = db.list_chats(_user_id())
+chats = db.list_chats(_user_id())
+current_chat = st.session_state.get("current_chat")
+
+# Streamlit อาจคง session state ไว้บางส่วนระหว่าง source reload/rerun ได้ จึงต้อง
+# ตรวจ current_chat และ messages แยกกัน ไม่เช่นนั้นอาจเหลือชื่อแชทแต่ไม่มี messages
+# แล้วเกิด KeyError ตอน render หน้าแชท นอกจากนี้ยังตรวจ ownership เพื่อไม่ให้ session
+# ที่เปลี่ยนผู้ใช้ไปเปิดแชทของบัญชีเดิมโดยบังเอิญ
+if current_chat not in chats:
     if chats:
-        st.session_state["current_chat"] = chats[0]
-        st.session_state["messages"] = db.load_chat(chats[0], _user_id())
+        current_chat = chats[0]
     else:
-        st.session_state["current_chat"] = _new_chat_filename()
-        st.session_state["messages"] = [
-            {"role": "model", "content": "Major.AI มึงจะถามอะไร", "timestamp": _now_str()}
-        ]
+        current_chat = _new_chat_filename()
+    st.session_state["current_chat"] = current_chat
+    st.session_state.pop("messages", None)
+
+if "messages" not in st.session_state:
+    loaded_messages = db.load_chat(current_chat, _user_id()) if current_chat in chats else []
+    st.session_state["messages"] = loaded_messages or _welcome_messages()
+    if not loaded_messages:
         save_chat()
 
 st.session_state.setdefault("active_topic_slug", None)
@@ -882,9 +895,7 @@ with st.sidebar:
                             st.session_state["mode_loaded_for_chat"] = remaining[0]
                         else:
                             st.session_state["current_chat"] = _new_chat_filename()
-                            st.session_state["messages"] = [
-                                {"role": "model", "content": "Major.AI มึงจะถามอะไร", "timestamp": _now_str()}
-                            ]
+                            st.session_state["messages"] = _welcome_messages()
                             save_chat()
                             set_current_chat_mode()
                     st.rerun()
