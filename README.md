@@ -14,6 +14,8 @@ embeddings, and Neon Postgres/pgvector storage.
 
 The first successful start creates an `admin` account whose password is
 `ADMIN_PASSWORD`. Existing chats without an owner are assigned to this account.
+After the account exists, use **บัญชี → เปลี่ยนรหัสผ่าน** in the app. The new
+password is hashed in Neon and does not require editing `.env` or redeploying.
 
 ## Knowledge ingestion
 

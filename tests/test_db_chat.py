@@ -118,6 +118,44 @@ class FakeConnectionContext:
 
 
 class ChatDatabaseTests(unittest.TestCase):
+    def test_change_own_password_checks_old_password_and_hashes_new_one(self):
+        cursor = FakeCursor()
+        cursor.fetchone = lambda: (db._hash_password("old-password"),)
+        connection = FakeConnection(cursor)
+        with mock.patch.object(
+            db, "_get_conn", return_value=FakeConnectionContext(connection)
+        ):
+            changed = db.change_user_password(
+                7, "old-password", "new-password-123"
+            )
+
+        self.assertTrue(changed)
+        update_query, update_params = cursor.executed[-1]
+        self.assertIn("UPDATE users SET password_hash", update_query)
+        self.assertEqual(update_params[1], 7)
+        self.assertTrue(db._verify_password("new-password-123", update_params[0]))
+        self.assertFalse(db._verify_password("old-password", update_params[0]))
+        self.assertTrue(connection.committed)
+
+    def test_change_own_password_rejects_wrong_old_password(self):
+        cursor = FakeCursor()
+        cursor.fetchone = lambda: (db._hash_password("correct-password"),)
+        connection = FakeConnection(cursor)
+        with mock.patch.object(
+            db, "_get_conn", return_value=FakeConnectionContext(connection)
+        ):
+            with self.assertRaisesRegex(ValueError, "รหัสผ่านเดิมไม่ถูกต้อง"):
+                db.change_user_password(7, "wrong-password", "new-password-123")
+
+        self.assertFalse(any("UPDATE users" in query for query, _ in cursor.executed))
+        self.assertFalse(connection.committed)
+
+    def test_change_own_password_rejects_short_or_reused_password(self):
+        with self.assertRaisesRegex(ValueError, "อย่างน้อย 8 ตัว"):
+            db.change_user_password(7, "old-password", "short")
+        with self.assertRaisesRegex(ValueError, "ต้องไม่ซ้ำ"):
+            db.change_user_password(7, "same-password", "same-password")
+
     def test_list_chat_summaries_uses_one_query_and_maps_all_sidebar_fields(self):
         cursor = FakeCursor([
             ("chat_a.json", "เรื่อง C", True, "c-language", "ภาษา C"),

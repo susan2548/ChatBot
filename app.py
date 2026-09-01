@@ -142,6 +142,9 @@ SAFETY_SETTINGS = [
 if "user" not in st.session_state:
     st.title("Cbot")
     st.caption("เข้าสู่ระบบเพื่อใช้แชตและ knowledge ส่วนตัว")
+    login_notice = st.session_state.pop("login_notice", None)
+    if login_notice:
+        st.success(login_notice)
     with st.form("user_login_form"):
         login_username = st.text_input("ชื่อผู้ใช้")
         login_password = st.text_input("รหัสผ่าน", type="password")
@@ -766,6 +769,52 @@ def render_admin_login():
     label = "Admin" if user["role"] == "admin" else user["username"]
     with st.popover(f"บัญชี: {label}"):
         st.caption(f"เข้าสู่ระบบเป็น {user['username']}")
+        with st.expander("เปลี่ยนรหัสผ่าน"):
+            st.caption("รหัสใหม่จะบันทึกแบบเข้ารหัสในฐานข้อมูล ไม่ต้องแก้ไฟล์ .env")
+            with st.form("change_own_password_form", clear_on_submit=True):
+                current_password = st.text_input(
+                    "รหัสผ่านเดิม", type="password",
+                    key="change_password_current",
+                )
+                new_password = st.text_input(
+                    "รหัสผ่านใหม่ (อย่างน้อย 8 ตัว)", type="password",
+                    key="change_password_new",
+                )
+                confirm_password = st.text_input(
+                    "ยืนยันรหัสผ่านใหม่", type="password",
+                    key="change_password_confirm",
+                )
+                change_submitted = st.form_submit_button(
+                    "บันทึกรหัสผ่านใหม่", type="primary",
+                )
+            if change_submitted:
+                if new_password != confirm_password:
+                    st.error("รหัสผ่านใหม่และช่องยืนยันไม่ตรงกัน")
+                else:
+                    try:
+                        db.change_user_password(
+                            user["id"], current_password, new_password
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        request_id = secrets.token_hex(4).upper()
+                        print(
+                            f"[Cbot][{request_id}] password change failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        st.error(
+                            "เปลี่ยนรหัสผ่านไม่สำเร็จ กรุณาลองใหม่ "
+                            f"(รหัสเหตุการณ์: {request_id})"
+                        )
+                    else:
+                        for key in list(st.session_state.keys()):
+                            del st.session_state[key]
+                        st.session_state["login_notice"] = (
+                            "เปลี่ยนรหัสผ่านสำเร็จ กรุณาเข้าสู่ระบบด้วยรหัสใหม่"
+                        )
+                        st.rerun()
+        st.divider()
         if st.button("ออกจากระบบ", key="logout_account"):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]

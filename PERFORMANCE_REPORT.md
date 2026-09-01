@@ -26,7 +26,7 @@
 - Source compilation validation for `app.py`, `db.py`, `generation_utils.py`, and
   `prompt.py` passed. (`py_compile` could not replace one locked Windows cache file,
   so the same Python compiler was run without writing bytecode.)
-- `python -m unittest discover -s tests -v` ran 30 tests: 28 passed and
+- `python -m unittest discover -s tests -v` ran 33 tests: 31 passed and
   2 OCR/file tests were skipped on the inspection machine because pandas is not
   installed there.
 - Added coverage for chat summary mapping, append ownership, sequence allocation,

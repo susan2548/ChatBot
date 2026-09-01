@@ -826,6 +826,19 @@ def _hash_password(password, salt=None):
     return "scrypt$" + base64.b64encode(salt).decode("ascii") + "$" + base64.b64encode(digest).decode("ascii")
 
 
+def _verify_password(password, stored_hash):
+    try:
+        algorithm, salt_b64, digest_b64 = stored_hash.split("$", 2)
+        if algorithm != "scrypt":
+            return False
+        actual = _hash_password(
+            password, base64.b64decode(salt_b64)
+        ).split("$", 2)[2]
+        return hmac.compare_digest(actual, digest_b64)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def ensure_admin_user(password):
     """Create the initial admin and attach legacy chats without an owner."""
     if not password:
@@ -857,12 +870,7 @@ def authenticate_user(username, password):
             row = cur.fetchone()
     if not row:
         return None
-    try:
-        _, salt_b64, digest_b64 = row[2].split("$", 2)
-        actual = _hash_password(password, base64.b64decode(salt_b64)).split("$", 2)[2]
-        if not hmac.compare_digest(actual, digest_b64):
-            return None
-    except Exception:
+    if not _verify_password(password, row[2]):
         return None
     return {"id": row[0], "username": row[1], "role": row[3]}
 
@@ -904,6 +912,30 @@ def reset_user_password(user_id, password):
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (_hash_password(password), user_id))
         conn.commit()
+
+
+def change_user_password(user_id, current_password, new_password):
+    """Change an authenticated user's own password after checking the old one."""
+    if len(new_password or "") < 8:
+        raise ValueError("รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัว")
+    if current_password == new_password:
+        raise ValueError("รหัสผ่านใหม่ต้องไม่ซ้ำกับรหัสผ่านเดิม")
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT password_hash FROM users "
+                "WHERE id = %s AND active = true FOR UPDATE",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if not row or not _verify_password(current_password or "", row[0]):
+                raise ValueError("รหัสผ่านเดิมไม่ถูกต้อง")
+            cur.execute(
+                "UPDATE users SET password_hash = %s WHERE id = %s",
+                (_hash_password(new_password), user_id),
+            )
+        conn.commit()
+    return True
 
 
 # ===== ประวัติแชท =====
