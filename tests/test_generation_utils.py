@@ -1,6 +1,7 @@
 import unittest
 
 from generation_utils import (
+    build_direct_knowledge_answer,
     DEFAULT_GENERATION_MODELS,
     PartialStreamError,
     generate_text_stream_with_fallback,
@@ -23,6 +24,19 @@ class FakeChunk:
 
 
 class GenerationUtilsTests(unittest.TestCase):
+    def test_direct_knowledge_answer_uses_retrieved_text_without_invention(self):
+        answer = build_direct_knowledge_answer([
+            {
+                "content": (
+                    "หัวข้อ: ลูป do while (Do While Loop) | "
+                    "เนื้อหา: do while ตรวจเงื่อนไขหลัง body จึงทำงานอย่างน้อยหนึ่งรอบ"
+                )
+            }
+        ])
+
+        self.assertIn("do while ตรวจเงื่อนไขหลัง body", answer)
+        self.assertIn("ใช้ข้อความจาก Knowledge โดยตรง", answer)
+
     def test_default_chain_uses_flash_then_current_flash_lite(self):
         self.assertEqual(parse_generation_models(), DEFAULT_GENERATION_MODELS)
         self.assertEqual(
