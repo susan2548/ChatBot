@@ -165,12 +165,13 @@ def generate_text_stream_with_fallback(
     extract_sources=None,
     max_attempts_per_model=2,
     sleep_fn=time.sleep,
+    on_reset=None,
 ):
     """Consume a text stream with model fallback before the first token.
 
-    A stream that fails after emitting text is never retried because doing so
-    would duplicate or mix two answers. Callers can replace the partial UI and
-    must not persist that incomplete answer.
+    If a stream fails after emitting text, a different model may be tried only
+    when the caller supplies ``on_reset`` to clear the partial UI first. The
+    incomplete answer is never returned as successful.
     """
     last_error = None
     for model_index, model_name in enumerate(models):
@@ -203,12 +204,20 @@ def generate_text_stream_with_fallback(
             except Exception as exc:
                 last_error = exc
                 if parts:
+                    if on_reset is not None and model_index < len(models) - 1:
+                        on_reset()
+                        break
                     raise PartialStreamError(str(exc)) from exc
                 if is_model_quota_error(exc) or is_model_unavailable_error(exc):
                     break
-                if not is_transient_generation_error(exc) or attempt == max_attempts_per_model - 1:
+                if not is_transient_generation_error(exc):
                     raise
-                sleep_fn(1.5 * (2 ** attempt))
+                if attempt < max_attempts_per_model - 1:
+                    sleep_fn(1.5 * (2 ** attempt))
+                    continue
+                # The current model exhausted its transient retries. Continue
+                # to the next configured model instead of failing immediately.
+                break
     if last_error:
         raise last_error
     raise RuntimeError("no generation models configured")

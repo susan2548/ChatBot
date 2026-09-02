@@ -46,6 +46,26 @@ class GenerationUtilsTests(unittest.TestCase):
     def test_server_error_is_retryable(self):
         self.assertTrue(is_transient_generation_error(FakeError("503 UNAVAILABLE")))
 
+    def test_transient_error_falls_back_after_current_model_attempts(self):
+        attempted = []
+
+        def start_stream(model_name):
+            attempted.append(model_name)
+            if model_name == "model-a":
+                raise FakeError("503 UNAVAILABLE")
+            return [FakeChunk("สำเร็จ")]
+
+        answer, model, _ = generate_text_stream_with_fallback(
+            ("model-a", "model-b"),
+            start_stream=start_stream,
+            reserve_slot=lambda: None,
+            on_delta=lambda delta: None,
+            max_attempts_per_model=1,
+        )
+        self.assertEqual(answer, "สำเร็จ")
+        self.assertEqual(model, "model-b")
+        self.assertEqual(attempted, ["model-a", "model-b"])
+
     def test_missing_model_can_fall_back(self):
         self.assertTrue(is_model_unavailable_error(FakeError("404 NOT_FOUND model")))
 
@@ -98,6 +118,33 @@ class GenerationUtilsTests(unittest.TestCase):
                 sleep_fn=lambda seconds: None,
             )
         self.assertEqual(attempted, ["model-a"])
+
+    def test_partial_stream_can_reset_before_fallback_model(self):
+        attempted = []
+        resets = []
+        displayed = []
+
+        def stream(model_name):
+            attempted.append(model_name)
+            if model_name == "model-a":
+                yield FakeChunk("คำตอบครึ่ง")
+                raise FakeError("connection reset")
+            yield FakeChunk("คำตอบใหม่ที่สมบูรณ์")
+
+        answer, model, _ = generate_text_stream_with_fallback(
+            ("model-a", "model-b"),
+            start_stream=stream,
+            reserve_slot=lambda: None,
+            on_delta=displayed.append,
+            max_attempts_per_model=1,
+            on_reset=lambda: (resets.append(True), displayed.clear()),
+        )
+
+        self.assertEqual(answer, "คำตอบใหม่ที่สมบูรณ์")
+        self.assertEqual(model, "model-b")
+        self.assertEqual(attempted, ["model-a", "model-b"])
+        self.assertEqual(resets, [True])
+        self.assertEqual(displayed, ["คำตอบใหม่ที่สมบูรณ์"])
 
     def test_repairs_executable_statement_flattened_after_c_comment(self):
         broken = '```c\n// This prints "Hello World" printf("Hello World");\nreturn 0;\n```'

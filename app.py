@@ -73,7 +73,7 @@ def _bounded_int_config(key, default, minimum, maximum):
 
 
 AI_REQUEST_TIMEOUT_MS = _bounded_int_config(
-    "AI_REQUEST_TIMEOUT_MS", 15000, 5000, 60000
+    "AI_REQUEST_TIMEOUT_MS", 30000, 5000, 60000
 )
 
 TEXT_EDITABLE_EXTS = {".txt", ".md", ".json", ".html", ".htm"}
@@ -248,21 +248,33 @@ def _generate_content_with_fallback(contents, config, max_attempts_per_model=1):
                         f"{type(exc).__name__}: {exc}"
                     )
                     break
-                if not is_transient_generation_error(exc) or attempt == max_attempts_per_model - 1:
+                if not is_transient_generation_error(exc):
                     raise
-                wait_seconds = 1.5 * (2 ** attempt)
+                if attempt < max_attempts_per_model - 1:
+                    wait_seconds = 1.5 * (2 ** attempt)
+                    print(
+                        f"[Cbot] transient error on {model_name}; retry "
+                        f"{attempt + 2}/{max_attempts_per_model} in {wait_seconds:.1f}s: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                next_model = (
+                    GENERATION_MODELS[model_index + 1]
+                    if model_index + 1 < len(GENERATION_MODELS)
+                    else "none"
+                )
                 print(
-                    f"[Cbot] transient error on {model_name}; retry "
-                    f"{attempt + 2}/{max_attempts_per_model} in {wait_seconds:.1f}s: "
+                    f"[Cbot] transient failure: {model_name}; next={next_model}: "
                     f"{type(exc).__name__}: {exc}"
                 )
-                time.sleep(wait_seconds)
+                break
     if last_error:
         raise last_error
     raise RuntimeError("no Gemini generation models configured")
 
 
-def _generate_content_stream_with_fallback(contents, config, on_delta):
+def _generate_content_stream_with_fallback(contents, config, on_delta, on_reset=None):
     answer, model_used, sources = generate_text_stream_with_fallback(
         models=GENERATION_MODELS,
         start_stream=lambda model_name: client.models.generate_content_stream(
@@ -274,6 +286,7 @@ def _generate_content_stream_with_fallback(contents, config, on_delta):
         on_delta=on_delta,
         extract_sources=_web_sources_from_response,
         max_attempts_per_model=1,
+        on_reset=on_reset,
     )
     if model_used != GENERATION_MODELS[0]:
         print(f"[Cbot] fallback streaming model succeeded: {model_used}")
@@ -610,13 +623,31 @@ def generate_response(prompt, force_web=False):
                 streamed_text += delta
                 answer_placeholder.markdown(streamed_text + "▌")
 
+            def reset_partial_stream():
+                nonlocal streamed_text
+                streamed_text = ""
+                answer_placeholder.empty()
+                status.update(label="การเชื่อมต่อขาด กำลังลองโมเดลสำรอง...")
+
             generation_started = time.perf_counter()
             successful = False
             model_used = None
             try:
-                answer, model_used, web_sources = _generate_content_stream_with_fallback(
-                    history, config, show_delta
-                )
+                if topic_slug and not force_web:
+                    # Knowledge answers do not need Google grounding metadata.
+                    # A complete response is more reliable than a long-lived
+                    # stream on the resource-limited Community Cloud process.
+                    response, model_used = _generate_content_with_fallback(
+                        history, config, max_attempts_per_model=1
+                    )
+                    answer = (response.text or "").strip()
+                    if not answer:
+                        raise RuntimeError("AI provider returned an empty response")
+                    web_sources = []
+                else:
+                    answer, model_used, web_sources = _generate_content_stream_with_fallback(
+                        history, config, show_delta, on_reset=reset_partial_stream
+                    )
                 answer = repair_c_code_blocks(answer)
                 if topic_slug and not force_web:
                     answer = ensure_c_hello_world_example(prompt, answer)
