@@ -264,6 +264,37 @@ class ChatDatabaseTests(unittest.TestCase):
         self.assertEqual(len(cursor.executed), 1)
         self.assertEqual(results[0]["source"], "c.csv")
 
+    def test_comparison_retrieval_keeps_evidence_for_both_loops(self):
+        cursor = FakeCursor([
+            (
+                "หัวข้อ: ลูป while (While Loop) | เนื้อหา: ตรวจเงื่อนไขก่อนแต่ละรอบ",
+                "loops.csv", {"location": "แถว 10"}, 0.88,
+            ),
+            (
+                "หัวข้อ: ลูป while (While Loop) | เนื้อหา: เหมาะเมื่อไม่รู้จำนวนรอบ",
+                "loops.csv", {"location": "แถว 11"}, 0.87,
+            ),
+            (
+                "หัวข้อ: ลูป for (For Loop) | เนื้อหา: เหมาะเมื่อรู้จำนวนรอบ",
+                "loops.csv", {"location": "แถว 20"}, 0.70,
+            ),
+        ])
+        connection = FakeConnection(cursor)
+        provider = types.SimpleNamespace(
+            profile="local-minilm-l12-v1",
+            embed_query=lambda text: [0.1, 0.2],
+        )
+        with mock.patch.object(
+            db, "_get_vector_conn", return_value=FakeConnectionContext(connection)
+        ), mock.patch.object(db, "get_embedding_provider", return_value=provider):
+            results = db.search_with_sources(
+                "c-language", "while loop กับ for loopต่างกันยังไง", top_k=5
+            )
+
+        contents = "\n".join(item["content"] for item in results)
+        self.assertIn("ลูป while", contents)
+        self.assertIn("ลูป for", contents)
+
 
 if __name__ == "__main__":
     unittest.main()

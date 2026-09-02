@@ -29,9 +29,11 @@ from google.genai import types
 from rag import read_file, chunk_text, build_chunks, iter_chunks, SUPPORTED_EXTS, ZIP_EXT
 from embedding_service import get_embedding_provider, LOCAL_DIMENSION, LOCAL_PROFILE
 from retrieval_utils import (
+    comparison_retrieval_anchors,
     extract_retrieval_terms,
     lexical_relevance,
     normalize_retrieval_query,
+    retrieval_anchor_strength,
     retrieval_topic_key,
 )
 
@@ -650,7 +652,10 @@ def search_with_sources(topic_slug, query, top_k=5, min_score=0.28, timing_out=N
     query_emb = provider.embed_query(semantic_query)
     embed_ms = (time.perf_counter() - embed_started) * 1000
     exact_terms = _extract_retrieval_terms(normalized_query)
-    candidate_limit = max(top_k * 8, 40)
+    comparison_anchors = comparison_retrieval_anchors(query)
+    # Comparison questions need enough candidates to contain evidence for both
+    # concepts, not only several chunks for whichever concept ranks first.
+    candidate_limit = max(top_k * 12, 60) if comparison_anchors else max(top_k * 8, 40)
     database_started = time.perf_counter()
     with _get_vector_conn() as conn:
         with conn.cursor() as cur:
@@ -722,11 +727,31 @@ def search_with_sources(topic_slug, query, top_k=5, min_score=0.28, timing_out=N
     if not ranked or ranked[0]["score"] < min_score:
         return []
     adaptive_floor = max(0.26, ranked[0]["score"] - 0.11)
+    priority_items = []
+    priority_ids = set()
+    for anchor in comparison_anchors:
+        candidates = [
+            item for item in ranked
+            if retrieval_anchor_strength(item["content"], anchor) > 0
+        ]
+        if not candidates:
+            continue
+        best = max(
+            candidates,
+            key=lambda item: (
+                retrieval_anchor_strength(item["content"], anchor),
+                item["score"],
+            ),
+        )
+        if id(best) not in priority_ids:
+            priority_items.append(best)
+            priority_ids.add(id(best))
+    ordered_ranked = priority_items + [item for item in ranked if id(item) not in priority_ids]
     results = []
     seen_content = set()
     topic_counts = {}
-    for item in ranked:
-        if item["score"] < adaptive_floor:
+    for item in ordered_ranked:
+        if item["score"] < adaptive_floor and id(item) not in priority_ids:
             continue
         content_key = re.sub(r"\s+", " ", item["content"].lower()).strip()
         if content_key in seen_content:

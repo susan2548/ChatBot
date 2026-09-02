@@ -2,9 +2,11 @@ import unittest
 
 try:
     from retrieval_utils import (
+        comparison_retrieval_anchors,
         extract_retrieval_terms,
         lexical_relevance,
         normalize_retrieval_query,
+        retrieval_anchor_strength,
         retrieval_topic_key,
     )
 except ModuleNotFoundError as exc:
@@ -64,6 +66,24 @@ class RetrievalHelperTests(unittest.TestCase):
         first = "หัวข้อ: ตัวแปร (Variables) | เนื้อหา: ส่วนแรก"
         second = "หัวข้อ: ตัวแปร (Variables) | เนื้อหา: ส่วนที่สอง"
         self.assertEqual(retrieval_topic_key(first), retrieval_topic_key(second))
+
+    def test_loop_comparison_without_space_keeps_both_concepts(self):
+        query = "while loop กับ for loopต่างกันยังไง"
+        normalized = normalize_retrieval_query(query)
+        terms = extract_retrieval_terms(normalized)
+
+        self.assertEqual(comparison_retrieval_anchors(query), ("while", "for"))
+        self.assertIn("while", terms)
+        self.assertIn("for", terms)
+        self.assertNotIn("วนซ้ำต่างกันยังไง", terms)
+
+    def test_loop_anchor_prefers_matching_topic_heading(self):
+        while_topic = "หัวข้อ: ลูป while (While Loop) | เนื้อหา: ตรวจเงื่อนไขก่อนแต่ละรอบ"
+        for_topic = "หัวข้อ: ลูป for (For Loop) | เนื้อหา: รวมตัวนับ เงื่อนไข และการอัปเดต"
+
+        self.assertEqual(retrieval_anchor_strength(while_topic, "while"), 2)
+        self.assertEqual(retrieval_anchor_strength(while_topic, "for"), 0)
+        self.assertEqual(retrieval_anchor_strength(for_topic, "for"), 2)
 
 
 if __name__ == "__main__":
