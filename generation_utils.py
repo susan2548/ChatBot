@@ -3,9 +3,13 @@ import time
 
 
 DEFAULT_GENERATION_MODELS = (
-    "gemini-2.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
 )
+
+LEGACY_MODEL_ALIASES = {
+    "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+}
 
 
 def parse_generation_models(configured_value=None):
@@ -17,8 +21,15 @@ def parse_generation_models(configured_value=None):
     )
     models = []
     for candidate in candidates:
-        model = str(candidate).strip()
+        model = LEGACY_MODEL_ALIASES.get(
+            str(candidate).strip(), str(candidate).strip()
+        )
         if model and model not in models:
+            models.append(model)
+    # Keep the supported defaults as fallbacks even when an older Secrets value
+    # configured only one model.
+    for model in DEFAULT_GENERATION_MODELS:
+        if model not in models:
             models.append(model)
     return tuple(models) or DEFAULT_GENERATION_MODELS
 
@@ -155,51 +166,6 @@ def ensure_c_hello_world_example(prompt, answer):
         "ผลลัพธ์:\n\n```text\nHello World\n```"
     )
     return str(answer or "").rstrip() + "\n\n" + verified
-
-
-def build_direct_knowledge_answer(retrieved, max_sections=3, max_section_chars=1200):
-    """Build a safe extractive answer when the generation provider is unavailable.
-
-    This deliberately does not invent or paraphrase facts. It presents the most
-    relevant retrieved passages and keeps the normal source list in the UI.
-    """
-    sections = []
-    seen = set()
-    for item in retrieved or []:
-        content = str(item.get("content") or "").strip()
-        if not content:
-            continue
-        if "|" in content:
-            raw_title, raw_body = content.split("|", 1)
-        else:
-            raw_title, raw_body = "ข้อมูลที่เกี่ยวข้อง", content
-        title = re.sub(r"^\s*หัวข้อ\s*:\s*", "", raw_title, flags=re.IGNORECASE).strip()
-        body = re.sub(r"^\s*เนื้อหา\s*:\s*", "", raw_body, flags=re.IGNORECASE).strip()
-        key = (title.lower(), re.sub(r"\s+", " ", body.lower())[:240])
-        if not body or key in seen:
-            continue
-        seen.add(key)
-        if len(body) > max_section_chars:
-            shortened = body[:max_section_chars].rsplit(" ", 1)[0].rstrip()
-            body = shortened + "…"
-        sections.append((title or "ข้อมูลที่เกี่ยวข้อง", body))
-        if len(sections) >= max_sections:
-            break
-
-    if not sections:
-        return "ไม่พบข้อความที่สามารถแสดงจาก Knowledge ได้"
-    if len(sections) == 1:
-        content = sections[0][1]
-    else:
-        content = "\n\n".join(
-            f"**{title}**\n\n{body}" for title, body in sections
-        )
-    return (
-        "ขณะนี้บริการ AI ไม่พร้อมใช้งาน จึงแสดงข้อมูลที่ค้นพบจาก Knowledge "
-        "โดยตรงโดยไม่แต่งข้อมูลเพิ่ม:\n\n"
-        f"{content}\n\n"
-        "_คำตอบสำรองนี้ใช้ข้อความจาก Knowledge โดยตรง_"
-    )
 
 
 def generate_text_stream_with_fallback(

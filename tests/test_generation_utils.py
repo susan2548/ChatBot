@@ -1,7 +1,6 @@
 import unittest
 
 from generation_utils import (
-    build_direct_knowledge_answer,
     DEFAULT_GENERATION_MODELS,
     PartialStreamError,
     generate_text_stream_with_fallback,
@@ -24,30 +23,23 @@ class FakeChunk:
 
 
 class GenerationUtilsTests(unittest.TestCase):
-    def test_direct_knowledge_answer_uses_retrieved_text_without_invention(self):
-        answer = build_direct_knowledge_answer([
-            {
-                "content": (
-                    "หัวข้อ: ลูป do while (Do While Loop) | "
-                    "เนื้อหา: do while ตรวจเงื่อนไขหลัง body จึงทำงานอย่างน้อยหนึ่งรอบ"
-                )
-            }
-        ])
-
-        self.assertIn("do while ตรวจเงื่อนไขหลัง body", answer)
-        self.assertIn("ใช้ข้อความจาก Knowledge โดยตรง", answer)
-
-    def test_default_chain_uses_flash_then_current_flash_lite(self):
+    def test_default_chain_prefers_current_flash_lite_then_flash(self):
         self.assertEqual(parse_generation_models(), DEFAULT_GENERATION_MODELS)
         self.assertEqual(
             DEFAULT_GENERATION_MODELS,
-            ("gemini-2.5-flash", "gemini-3.5-flash-lite"),
+            ("gemini-3.5-flash-lite", "gemini-2.5-flash"),
         )
 
     def test_configured_chain_is_trimmed_and_deduplicated(self):
         self.assertEqual(
             parse_generation_models(" gemini-a,gemini-b,gemini-a "),
-            ("gemini-a", "gemini-b"),
+            ("gemini-a", "gemini-b", *DEFAULT_GENERATION_MODELS),
+        )
+
+    def test_legacy_flash_lite_secret_is_upgraded_and_keeps_fallback(self):
+        self.assertEqual(
+            parse_generation_models("gemini-2.5-flash-lite"),
+            DEFAULT_GENERATION_MODELS,
         )
 
     def test_daily_quota_switches_model_without_retry(self):

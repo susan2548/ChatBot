@@ -13,7 +13,6 @@ from google import genai
 from google.genai import types
 from prompt import SINGLE_MODE
 from generation_utils import (
-    build_direct_knowledge_answer,
     ensure_c_hello_world_example,
     PartialStreamError,
     generate_text_stream_with_fallback,
@@ -74,7 +73,7 @@ def _bounded_int_config(key, default, minimum, maximum):
 
 
 AI_REQUEST_TIMEOUT_MS = _bounded_int_config(
-    "AI_REQUEST_TIMEOUT_MS", 30000, 5000, 60000
+    "AI_REQUEST_TIMEOUT_MS", 60000, 45000, 120000
 )
 
 TEXT_EDITABLE_EXTS = {".txt", ".md", ".json", ".html", ".htm"}
@@ -198,7 +197,7 @@ _rate_lock, _request_times = _shared_rate_state()
 
 RATE_LIMIT_MAX = 8        # เผื่อ buffer ไว้ใต้เพดานจริงของ Gemini free tier (~10 req/นาที)
 RATE_LIMIT_WINDOW = 60    # วินาที
-RATE_LIMIT_MAX_WAIT = 3   # อย่าปล่อยให้หน้าเว็บดูเหมือนค้างเมื่อคิวเต็ม
+RATE_LIMIT_MAX_WAIT = 65  # ยอมรอรอบโควตาถัดไป แทนการตอบว่าคิวเต็มทันที
 
 
 class _RateQueueFullError(RuntimeError):
@@ -632,29 +631,14 @@ def generate_response(prompt, force_web=False):
 
             generation_started = time.perf_counter()
             successful = False
-            cacheable_answer = True
             model_used = None
-
-            def complete_from_knowledge_directly():
-                nonlocal answer, successful, cacheable_answer, model_used
-                if not (topic_slug and not force_web and retrieved):
-                    return False
-                answer = build_direct_knowledge_answer(retrieved)
-                answer_placeholder.markdown(answer)
-                successful = True
-                cacheable_answer = False
-                model_used = "knowledge-direct"
-                st.session_state.pop("retry_request", None)
-                status.update(label="ตอบจาก Knowledge โดยตรง", state="complete")
-                return True
-
             try:
                 if topic_slug and not force_web:
                     # Knowledge answers do not need Google grounding metadata.
                     # A complete response is more reliable than a long-lived
                     # stream on the resource-limited Community Cloud process.
                     response, model_used = _generate_content_with_fallback(
-                        history, config, max_attempts_per_model=1
+                        history, config, max_attempts_per_model=2
                     )
                     answer = (response.text or "").strip()
                     if not answer:
@@ -675,49 +659,46 @@ def generate_response(prompt, force_web=False):
                 print(f"[Cbot] generation model used: {model_used}")
                 status.update(label="ตอบเสร็จแล้ว", state="complete")
             except _RateQueueFullError as exc:
-                if not complete_from_knowledge_directly():
-                    answer = (
-                        f"คิว AI เต็มชั่วคราว กรุณาลองใหม่ในประมาณ {exc.retry_after} วินาที "
-                        f"(รหัสเหตุการณ์: {request_id})"
-                    )
-                    st.session_state["retry_request"] = {
-                        "prompt": prompt, "force_web": force_web,
-                    }
-                    answer_placeholder.markdown(answer)
-                    status.update(label="คิวเต็ม", state="error")
+                answer = (
+                    f"คิว AI เต็มชั่วคราว กรุณาลองใหม่ในประมาณ {exc.retry_after} วินาที "
+                    f"(รหัสเหตุการณ์: {request_id})"
+                )
+                st.session_state["retry_request"] = {
+                    "prompt": prompt, "force_web": force_web,
+                }
+                answer_placeholder.markdown(answer)
+                status.update(label="คิวเต็ม", state="error")
             except PartialStreamError as exc:
                 print(f"[Cbot][{request_id}] partial stream discarded: {type(exc).__name__}: {exc}")
-                if not complete_from_knowledge_directly():
-                    answer = (
-                        "การเชื่อมต่อ AI ขาดระหว่างตอบ ระบบไม่ได้บันทึกคำตอบที่ไม่สมบูรณ์ "
-                        f"กรุณาลองใหม่ (รหัสเหตุการณ์: {request_id})"
-                    )
-                    st.session_state["retry_request"] = {
-                        "prompt": prompt, "force_web": force_web,
-                    }
-                    answer_placeholder.markdown(answer)
-                    status.update(label="การเชื่อมต่อขาดระหว่างตอบ", state="error")
+                answer = (
+                    "การเชื่อมต่อ AI ขาดระหว่างตอบ ระบบไม่ได้บันทึกคำตอบที่ไม่สมบูรณ์ "
+                    f"กรุณาลองใหม่ (รหัสเหตุการณ์: {request_id})"
+                )
+                st.session_state["retry_request"] = {
+                    "prompt": prompt, "force_web": force_web,
+                }
+                answer_placeholder.markdown(answer)
+                status.update(label="การเชื่อมต่อขาดระหว่างตอบ", state="error")
             except Exception as exc:
                 error_text = f"{type(exc).__name__}: {exc}".lower()
                 print(f"[Cbot][{request_id}] generate_content error: {type(exc).__name__}: {exc}")
-                if not complete_from_knowledge_directly():
-                    if "timeout" in error_text or "deadline" in error_text:
-                        answer = (
-                            f"AI ตอบไม่ทันภายใน {AI_REQUEST_TIMEOUT_MS // 1000} วินาที "
-                            f"กรุณากดลองใหม่ (รหัสเหตุการณ์: {request_id})"
-                        )
-                        error_label = "AI ตอบเกินเวลาที่กำหนด"
-                    else:
-                        answer = (
-                            "ผู้ให้บริการ AI ขัดข้องชั่วคราว กรุณาลองใหม่ "
-                            f"(รหัสเหตุการณ์: {request_id})"
-                        )
-                        error_label = "เกิดข้อผิดพลาด"
-                    st.session_state["retry_request"] = {
-                        "prompt": prompt, "force_web": force_web,
-                    }
-                    answer_placeholder.markdown(answer)
-                    status.update(label=error_label, state="error")
+                if "timeout" in error_text or "deadline" in error_text:
+                    answer = (
+                        f"AI ตอบไม่ทันภายใน {AI_REQUEST_TIMEOUT_MS // 1000} วินาที "
+                        f"กรุณากดลองใหม่ (รหัสเหตุการณ์: {request_id})"
+                    )
+                    error_label = "AI ตอบเกินเวลาที่กำหนด"
+                else:
+                    answer = (
+                        "ผู้ให้บริการ AI ขัดข้องชั่วคราว กรุณาลองใหม่ "
+                        f"(รหัสเหตุการณ์: {request_id})"
+                    )
+                    error_label = "เกิดข้อผิดพลาด"
+                st.session_state["retry_request"] = {
+                    "prompt": prompt, "force_web": force_web,
+                }
+                answer_placeholder.markdown(answer)
+                status.update(label=error_label, state="error")
             timings["generation_ms"] = (time.perf_counter() - generation_started) * 1000
 
         if retrieved:
@@ -733,7 +714,7 @@ def generate_response(prompt, force_web=False):
         "role": "model", "content": answer, "timestamp": _now_str(),
         "sources": message_sources,
     })
-    if successful and cacheable_answer:
+    if successful:
         cache_started = time.perf_counter()
         try:
             store_cached_answer(prompt, topic_slug, answer, sources=message_sources)
